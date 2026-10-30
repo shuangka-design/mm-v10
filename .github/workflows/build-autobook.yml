@@ -1,0 +1,1700 @@
+name: Build AutoBook APK (v1 auto expense book)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Generate project
+        run: |
+          set -e
+          P=/tmp/ab
+          J=$P/app/src/main/java/com/example/autobook
+          mkdir -p $J
+          cd $P
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AutoBook"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.10.1" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+          }
+          android {
+              namespace = "com.example.autobook"
+              compileSdk = 36
+              defaultConfig {
+                  applicationId = "com.example.autobook"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
+              implementation("com.google.guava:guava:33.3.1-android")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.android.gms:play-services-tasks:18.2.0")
+              implementation(platform("org.jetbrains.kotlin:kotlin-bom:2.1.0"))
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:icon="@android:drawable/ic_menu_agenda"
+                  android:label="AutoBook"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".EditActivity" android:exported="false"
+                      android:windowSoftInputMode="adjustResize" />
+                  <service
+                      android:name=".BankNotificationService"
+                      android:label="AutoBook"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $J/Db.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.database.DatabaseUtils;
+          import android.database.sqlite.SQLiteDatabase;
+          import android.database.sqlite.SQLiteOpenHelper;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** All data lives in one SQLite file: book.db */
+          public class Db extends SQLiteOpenHelper {
+              public static class Tx {
+                  public long id = 0, ts = 0;
+                  public int type = 0;            // 0 = expense, 1 = income
+                  public double amount = 0;
+                  public String account = "", category = "", note = "", photo = "", source = "manual", bank = "";
+                  public boolean needAi = false, needCat = false;
+              }
+
+              private static Db inst;
+
+              public static synchronized Db get(Context c) {
+                  if (inst == null) inst = new Db(c.getApplicationContext());
+                  return inst;
+              }
+
+              public static synchronized void reset() {
+                  if (inst != null) { inst.close(); inst = null; }
+              }
+
+              private Db(Context c) {
+                  super(c, "book.db", null, 1);
+                  setWriteAheadLoggingEnabled(false); // single file -> easy backup
+              }
+
+              @Override
+              public void onCreate(SQLiteDatabase d) {
+                  d.execSQL("CREATE TABLE tx (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type INTEGER, amount REAL, "
+                      + "account TEXT, category TEXT, note TEXT, photo TEXT, source TEXT, bank TEXT, "
+                      + "need_ai INTEGER DEFAULT 0, need_cat INTEGER DEFAULT 0)");
+                  d.execSQL("CREATE INDEX tx_ts ON tx(ts)");
+                  d.execSQL("CREATE TABLE cat (name TEXT, type INTEGER, ord INTEGER, PRIMARY KEY(name, type))");
+                  d.execSQL("CREATE TABLE acc (name TEXT PRIMARY KEY, ord INTEGER)");
+                  d.execSQL("CREATE TABLE shopcat (shop TEXT PRIMARY KEY, category TEXT)");
+                  String[] accs = { "กรุงไทย", "กรุงศรี", "ออมสิน", "TrueMoney", "AAT", "Cash", "Card" };
+                  for (int i = 0; i < accs.length; i++) {
+                      ContentValues v = new ContentValues();
+                      v.put("name", accs[i]); v.put("ord", i);
+                      d.insert("acc", null, v);
+                  }
+                  String[] ex = { "🍜 Food", "Lunch", "Dinner", "กาแฟ", "SHOPPEE", "TRUE MONEY", "น้ำมัน",
+                      "ทำงาน", "🪑 Household", "Schooling", "Other" };
+                  for (int i = 0; i < ex.length; i++) {
+                      ContentValues v = new ContentValues();
+                      v.put("name", ex[i]); v.put("type", 0); v.put("ord", i);
+                      d.insert("cat", null, v);
+                  }
+                  String[] in = { "เงินเดือน", "Other" };
+                  for (int i = 0; i < in.length; i++) {
+                      ContentValues v = new ContentValues();
+                      v.put("name", in[i]); v.put("type", 1); v.put("ord", i);
+                      d.insert("cat", null, v);
+                  }
+              }
+
+              @Override
+              public void onUpgrade(SQLiteDatabase d, int o, int n) { }
+
+              private static String s(String x) { return x == null ? "" : x; }
+
+              private static ContentValues cv(Tx t) {
+                  ContentValues v = new ContentValues();
+                  v.put("ts", t.ts); v.put("type", t.type); v.put("amount", t.amount);
+                  v.put("account", s(t.account)); v.put("category", s(t.category)); v.put("note", s(t.note));
+                  v.put("photo", s(t.photo)); v.put("source", s(t.source)); v.put("bank", s(t.bank));
+                  v.put("need_ai", t.needAi ? 1 : 0); v.put("need_cat", t.needCat ? 1 : 0);
+                  return v;
+              }
+
+              private static Tx read(Cursor c) {
+                  Tx t = new Tx();
+                  t.id = c.getLong(c.getColumnIndexOrThrow("id"));
+                  t.ts = c.getLong(c.getColumnIndexOrThrow("ts"));
+                  t.type = c.getInt(c.getColumnIndexOrThrow("type"));
+                  t.amount = c.getDouble(c.getColumnIndexOrThrow("amount"));
+                  t.account = s(c.getString(c.getColumnIndexOrThrow("account")));
+                  t.category = s(c.getString(c.getColumnIndexOrThrow("category")));
+                  t.note = s(c.getString(c.getColumnIndexOrThrow("note")));
+                  t.photo = s(c.getString(c.getColumnIndexOrThrow("photo")));
+                  t.source = s(c.getString(c.getColumnIndexOrThrow("source")));
+                  t.bank = s(c.getString(c.getColumnIndexOrThrow("bank")));
+                  t.needAi = c.getInt(c.getColumnIndexOrThrow("need_ai")) == 1;
+                  t.needCat = c.getInt(c.getColumnIndexOrThrow("need_cat")) == 1;
+                  return t;
+              }
+
+              public synchronized long insert(Tx t) {
+                  t.id = getWritableDatabase().insert("tx", null, cv(t));
+                  return t.id;
+              }
+
+              public synchronized void update(Tx t) {
+                  getWritableDatabase().update("tx", cv(t), "id=?", new String[] { String.valueOf(t.id) });
+              }
+
+              public synchronized void delete(long id) {
+                  getWritableDatabase().delete("tx", "id=?", new String[] { String.valueOf(id) });
+              }
+
+              public synchronized void deleteSource(String src) {
+                  getWritableDatabase().delete("tx", "source=?", new String[] { src });
+              }
+
+              public synchronized List<Tx> query(String where, String[] args, String order) {
+                  List<Tx> out = new ArrayList<>();
+                  try (Cursor c = getReadableDatabase().query("tx", null, where, args, null, null, order)) {
+                      while (c.moveToNext()) out.add(read(c));
+                  }
+                  return out;
+              }
+
+              public Tx get(long id) {
+                  List<Tx> l = query("id=?", new String[] { String.valueOf(id) }, null);
+                  return l.isEmpty() ? null : l.get(0);
+              }
+
+              public List<Tx> range(long from, long to) {
+                  return query("ts>=? AND ts<?", new String[] { String.valueOf(from), String.valueOf(to) }, "ts DESC, id DESC");
+              }
+
+              public List<Tx> pending() {
+                  return query("need_ai=1 OR need_cat=1", null, "ts DESC");
+              }
+
+              /** same bank + same amount recently (bank apps often post the same notification twice) */
+              public boolean duplicate(String bank, double amount, long since) {
+                  return !query("bank=? AND ABS(amount-?)<0.005 AND ts>?",
+                      new String[] { bank, String.valueOf(amount), String.valueOf(since) }, null).isEmpty();
+              }
+
+              /** latest tx from this bank (null = any bank) since time, optionally only without photo */
+              public Tx recent(String bank, String source, long since, boolean noPhoto) {
+                  List<String> a = new ArrayList<>();
+                  StringBuilder w = new StringBuilder("ts>?");
+                  a.add(String.valueOf(since));
+                  if (bank != null) { w.append(" AND bank=?"); a.add(bank); }
+                  else { w.append(" AND bank<>''"); }
+                  if (source != null) { w.append(" AND source=?"); a.add(source); }
+                  if (noPhoto) w.append(" AND (photo IS NULL OR photo='')");
+                  List<Tx> l = query(w.toString(), a.toArray(new String[0]), "ts DESC");
+                  return l.isEmpty() ? null : l.get(0);
+              }
+
+              private List<String> names(String sql, String[] args) {
+                  List<String> out = new ArrayList<>();
+                  try (Cursor c = getReadableDatabase().rawQuery(sql, args)) {
+                      while (c.moveToNext()) out.add(c.getString(0));
+                  }
+                  return out;
+              }
+
+              public synchronized List<String> categories(int type) {
+                  return names("SELECT name FROM cat WHERE type=? ORDER BY ord", new String[] { String.valueOf(type) });
+              }
+
+              public synchronized List<String> accounts() {
+                  return names("SELECT name FROM acc ORDER BY ord", null);
+              }
+
+              public synchronized void addCategory(String name, int type) {
+                  if (name == null || name.trim().isEmpty()) return;
+                  SQLiteDatabase d = getWritableDatabase();
+                  ContentValues v = new ContentValues();
+                  v.put("name", name.trim()); v.put("type", type);
+                  v.put("ord", DatabaseUtils.queryNumEntries(d, "cat"));
+                  d.insertWithOnConflict("cat", null, v, SQLiteDatabase.CONFLICT_IGNORE);
+              }
+
+              public synchronized void addAccount(String name) {
+                  if (name == null || name.trim().isEmpty()) return;
+                  SQLiteDatabase d = getWritableDatabase();
+                  ContentValues v = new ContentValues();
+                  v.put("name", name.trim());
+                  v.put("ord", DatabaseUtils.queryNumEntries(d, "acc"));
+                  d.insertWithOnConflict("acc", null, v, SQLiteDatabase.CONFLICT_IGNORE);
+              }
+
+              public synchronized void rememberShop(String shop, String cat) {
+                  if (shop == null || shop.isEmpty() || cat == null || cat.isEmpty()) return;
+                  ContentValues v = new ContentValues();
+                  v.put("shop", shop); v.put("category", cat);
+                  getWritableDatabase().insertWithOnConflict("shopcat", null, v, SQLiteDatabase.CONFLICT_REPLACE);
+              }
+
+              public synchronized String shopCategory(String shop) {
+                  if (shop == null || shop.isEmpty()) return null;
+                  List<String> l = names("SELECT category FROM shopcat WHERE shop=?", new String[] { shop });
+                  return l.isEmpty() ? null : l.get(0);
+              }
+          }
+          EOF
+
+          cat > $J/Util.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          public class Util {
+              public static String money(double v) { return String.format(Locale.US, "%,.2f", v); }
+
+              public static String cut(String s, int n) {
+                  if (s == null) return "";
+                  return s.length() > n ? s.substring(0, n) + "…" : s;
+              }
+
+              /** shop key for remembering categories: drop numbers/dates/amounts */
+              public static String key(String note) {
+                  if (note == null) return "";
+                  String k = note.replaceAll("[0-9.,:/\\-]+", " ").replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+                  return k.length() > 40 ? k.substring(0, 40) : k;
+              }
+
+              /** bank label -> account name in this app */
+              public static String account(String bank) {
+                  if ("KTB".equals(bank)) return "กรุงไทย";
+                  if ("KMA".equals(bank)) return "กรุงศรี";
+                  if ("GSB".equals(bank)) return "ออมสิน";
+                  if ("BBL".equals(bank)) return "กรุงเทพ";
+                  if ("TrueMoney".equals(bank)) return "TrueMoney";
+                  return "Cash";
+              }
+
+              private static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences("autobook", Context.MODE_PRIVATE);
+              }
+
+              public static synchronized void debug(Context c, String line) {
+                  String time = new SimpleDateFormat("dd/MM HH:mm:ss", Locale.US).format(new Date());
+                  String entry = "[" + time + "] " + (line == null ? "" : line.replace("\n", " "));
+                  String old = p(c).getString("debug", "");
+                  String[] lines = (old.isEmpty() ? entry : entry + "\n" + old).split("\n");
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < lines.length && i < 25; i++) {
+                      if (i > 0) sb.append("\n");
+                      sb.append(lines[i]);
+                  }
+                  p(c).edit().putString("debug", sb.toString()).apply();
+              }
+
+              public static String debugLog(Context c) { return p(c).getString("debug", ""); }
+          }
+          EOF
+
+          cat > $J/Photos.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.Context;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.net.Uri;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          /** Slip photos are copied into the app, so they stay even if deleted from the gallery. */
+          public class Photos {
+              public static File dir(Context c) {
+                  File d = new File(c.getFilesDir(), "photos");
+                  if (!d.exists()) d.mkdirs();
+                  return d;
+              }
+
+              public static File file(Context c, String name) { return new File(dir(c), name); }
+
+              public static void copy(InputStream in, OutputStream out) throws IOException {
+                  byte[] b = new byte[16384];
+                  int n;
+                  while ((n = in.read(b)) > 0) out.write(b, 0, n);
+              }
+
+              public static String copy(Context c, Uri uri) throws IOException {
+                  String name = "p" + System.currentTimeMillis() + ".jpg";
+                  try (InputStream in = c.getContentResolver().openInputStream(uri);
+                       OutputStream out = new FileOutputStream(file(c, name))) {
+                      if (in == null) throw new IOException("เปิดรูปไม่ได้");
+                      copy(in, out);
+                  }
+                  return name;
+              }
+
+              public static Bitmap load(File f, int max) {
+                  if (f == null || !f.exists()) return null;
+                  BitmapFactory.Options o = new BitmapFactory.Options();
+                  o.inJustDecodeBounds = true;
+                  BitmapFactory.decodeFile(f.getPath(), o);
+                  int s = 1;
+                  while (Math.max(o.outWidth, o.outHeight) / s > max) s *= 2;
+                  BitmapFactory.Options o2 = new BitmapFactory.Options();
+                  o2.inSampleSize = s;
+                  return BitmapFactory.decodeFile(f.getPath(), o2);
+              }
+
+              public static void delete(Context c, String name) {
+                  if (name != null && !name.isEmpty()) file(c, name).delete();
+              }
+          }
+          EOF
+
+          cat > $J/BankParser.java << 'EOF'
+          package com.example.autobook;
+
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class BankParser {
+              public static final Map<String, String> BANKS = new HashMap<>();
+              static {
+                  BANKS.put("ktbcs.netbank", "KTB");
+                  BANKS.put("com.bbl.mobilebanking", "BBL");
+                  BANKS.put("com.bangkokbank.mobilebanking", "BBL");
+                  BANKS.put("com.krungsri.kma", "KMA");
+                  BANKS.put("com.gsb.mymo", "GSB");
+                  BANKS.put("th.co.truemoney.wallet", "TrueMoney");
+              }
+
+              private static final String[][] FOLDERS = {
+                  { "krungthai", "KTB" }, { "ktb", "KTB" },
+                  { "bualuang", "BBL" }, { "bangkok bank", "BBL" }, { "bbl", "BBL" },
+                  { "krungsri", "KMA" }, { "kma", "KMA" },
+                  { "mymo", "GSB" }, { "gsb", "GSB" },
+                  { "truemoney", "TrueMoney" },
+                  { "slip", "SLIP" }
+              };
+
+              private static final String[] IGNORE = { "OTP", "รหัสยืนยัน" };
+              private static final String[] INCOME = { "เงินเข้า", "รับเงิน", "ได้รับเงิน", "รับโอน", "เติมเงินเข้า" };
+
+              private static final String NUM = "([0-9][0-9,]*(?:\\.[0-9]{1,2})?)";
+              private static final Pattern AFTER = Pattern.compile(
+                  "-?" + NUM + "\\s*(?:บาท|บ\\.|THB|฿)", Pattern.CASE_INSENSITIVE);
+              private static final Pattern BEFORE = Pattern.compile(
+                  "(?:THB|฿|จำนวนเงิน|จำนวน|ยอดเงิน|ยอด)\\s*:?\\s*-?" + NUM, Pattern.CASE_INSENSITIVE);
+
+              public static class Result {
+                  public String bank, note;
+                  public double amount;
+                  public int type; // 0 expense, 1 income
+              }
+
+              public static boolean isBank(String pkg) { return BANKS.containsKey(pkg); }
+
+              public static String bankFromPath(String path) {
+                  String l = path.toLowerCase(Locale.ROOT);
+                  for (String[] f : FOLDERS) if (l.contains(f[0])) return f[1];
+                  return null;
+              }
+
+              public static Result parse(String pkg, String title, String text) {
+                  String bank = BANKS.get(pkg);
+                  if (bank == null) return null;
+                  String msg = title + " " + text;
+                  String up = msg.toUpperCase(Locale.ROOT);
+                  for (String w : IGNORE) if (up.contains(w.toUpperCase(Locale.ROOT))) return null;
+                  String a = find(AFTER, msg);
+                  if (a == null) a = find(BEFORE, msg);
+                  if (a == null) return null;
+                  Result r = new Result();
+                  r.bank = bank;
+                  r.amount = Double.parseDouble(a);
+                  r.type = 0;
+                  for (String w : INCOME) if (msg.contains(w)) { r.type = 1; break; }
+                  String note = text.isEmpty() ? title : text;
+                  r.note = note.length() > 80 ? note.substring(0, 80) : note;
+                  return r;
+              }
+
+              private static String find(Pattern p, String s) {
+                  Matcher m = p.matcher(s);
+                  while (m.find()) {
+                      String a = m.group(1).replace(",", "");
+                      try { if (Double.parseDouble(a) > 0) return a; } catch (NumberFormatException ignored) { }
+                  }
+                  return null;
+              }
+          }
+          EOF
+
+          cat > $J/Ai.java << 'EOF'
+          package com.example.autobook;
+
+          import android.graphics.Bitmap;
+          import com.google.mlkit.genai.common.DownloadCallback;
+          import com.google.mlkit.genai.common.FeatureStatus;
+          import com.google.mlkit.genai.common.GenAiException;
+          import com.google.mlkit.genai.prompt.Content;
+          import com.google.mlkit.genai.prompt.GenerateContentRequest;
+          import com.google.mlkit.genai.prompt.GenerateContentResponse;
+          import com.google.mlkit.genai.prompt.Generation;
+          import com.google.mlkit.genai.prompt.ImagePart;
+          import com.google.mlkit.genai.prompt.TextPart;
+          import com.google.mlkit.genai.prompt.java.GenerativeModelFutures;
+          import java.io.File;
+          import java.util.List;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /** On-device Gemini Nano. Call from a background thread while the app is on screen. */
+          public class Ai {
+              private static final Pattern P_AMT = Pattern.compile("AMOUNT\\s*=\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)");
+              private static final Pattern P_SHOP = Pattern.compile("SHOP\\s*=\\s*([^;\\n]*)");
+              private static final Pattern P_CAT = Pattern.compile("CAT\\s*=\\s*([^;\\n]*)");
+
+              private static GenerativeModelFutures model;
+
+              private static synchronized GenerativeModelFutures m() {
+                  if (model == null) model = GenerativeModelFutures.from(Generation.INSTANCE.getClient());
+                  return model;
+              }
+
+              public static int status() {
+                  try { return m().checkStatus().get(); } catch (Exception e) { return -1; }
+              }
+
+              public static boolean ready() { return status() == FeatureStatus.AVAILABLE; }
+
+              public static boolean downloadable(int s) { return s == FeatureStatus.DOWNLOADABLE; }
+
+              public static String statusText(int s) {
+                  if (s == FeatureStatus.AVAILABLE) return "พร้อมใช้ ✅";
+                  if (s == FeatureStatus.DOWNLOADABLE) return "ยังไม่ได้ดาวน์โหลด (กดปุ่ม 4)";
+                  if (s == FeatureStatus.DOWNLOADING) return "กำลังดาวน์โหลด...";
+                  if (s == FeatureStatus.UNAVAILABLE) return "เครื่องนี้ยังใช้ไม่ได้ ❌";
+                  return "ตรวจสอบไม่ได้ ❌";
+              }
+
+              public interface Progress { void msg(String m); }
+
+              public static void download(Progress cb) {
+                  m().download(new DownloadCallback() {
+                      @Override public void onDownloadStarted(long bytes) { cb.msg("เริ่มดาวน์โหลด AI..."); }
+                      @Override public void onDownloadProgress(long done) { cb.msg("ดาวน์โหลดแล้ว " + (done / 1048576L) + " MB"); }
+                      @Override public void onDownloadCompleted() { cb.msg("ดาวน์โหลด AI เสร็จแล้ว ✅"); }
+                      @Override public void onDownloadFailed(GenAiException e) { cb.msg("ดาวน์โหลดไม่สำเร็จ: " + e.getMessage()); }
+                  });
+              }
+
+              private static String ask(GenerateContentRequest.Builder b) throws Exception {
+                  b.setTemperature(0f);
+                  b.setTopK(1);
+                  b.setMaxOutputTokens(120);
+                  GenerateContentResponse r = m().generateContent(b.build()).get();
+                  if (r.getCandidates().isEmpty()) return "";
+                  String t = r.getCandidates().get(0).getText();
+                  return t == null ? "" : t;
+              }
+
+              /** returns {amount, shop, category} or null */
+              public static String[] readSlip(File f, List<String> cats) throws Exception {
+                  Bitmap bmp = Photos.load(f, 1600);
+                  if (bmp == null) return null;
+                  String prompt = "This image is a Thai bank transfer or payment slip. "
+                      + "Reply with exactly one line in this format and nothing else:\n"
+                      + "AMOUNT=<amount>;SHOP=<receiver name>;CAT=<category>\n"
+                      + "AMOUNT is the paid amount (จำนวนเงิน / จำนวน) as a number like 150.00. "
+                      + "It is NOT the fee (ค่าธรรมเนียม) and NOT the balance (ยอดคงเหลือ). "
+                      + "SHOP is the receiver (ไปยัง / ผู้รับ / ร้าน), keep Thai text as written. "
+                      + "CAT must be exactly one of: " + String.join(", ", cats) + ". "
+                      + "If this is not a payment slip, reply NONE.";
+                  GenerateContentRequest.Builder b = new GenerateContentRequest.Builder(
+                      new Content.Builder()
+                          .addPart(new ImagePart(bmp))
+                          .addPart(new TextPart(prompt))
+                          .build());
+                  String out = ask(b);
+                  Matcher ma = P_AMT.matcher(out);
+                  if (!ma.find()) return null;
+                  Matcher ms = P_SHOP.matcher(out);
+                  Matcher mc = P_CAT.matcher(out);
+                  return new String[] {
+                      ma.group(1).replace(",", ""),
+                      ms.find() ? ms.group(1).trim() : "",
+                      mc.find() ? fixCat(mc.group(1), cats) : ""
+                  };
+              }
+
+              public static String categorize(String text, List<String> cats) throws Exception {
+                  String prompt = "Classify this Thai payment into exactly one category from this list: "
+                      + String.join(", ", cats) + ". Reply with the category only.\nPayment: " + text;
+                  return fixCat(ask(new GenerateContentRequest.Builder(new TextPart(prompt))), cats);
+              }
+
+              private static String fixCat(String s, List<String> cats) {
+                  if (s == null) return "";
+                  String best = "";
+                  for (String c : cats) if (s.contains(c) && c.length() > best.length()) best = c;
+                  return best;
+              }
+          }
+          EOF
+
+          cat > $J/Slip.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.Context;
+          import android.net.Uri;
+          import com.google.android.gms.tasks.Tasks;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.Text;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+          import java.io.File;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /** Quick number-only OCR (works in background). AI re-checks later. */
+          public class Slip {
+              private static TextRecognizer rec;
+              private static final Pattern MONEY = Pattern.compile(
+                  "(?<![0-9.,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\\.([0-9]{2})(?![0-9]|\\.[0-9])");
+
+              /** call from a background thread */
+              public static String readAmount(Context ctx, File f) {
+                  try {
+                      InputImage img = InputImage.fromFilePath(ctx, Uri.fromFile(f));
+                      synchronized (Slip.class) {
+                          if (rec == null) rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                      }
+                      Text t = Tasks.await(rec.process(img));
+                      return pick(t.getText());
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              static String pick(String s) {
+                  Matcher m = MONEY.matcher(s);
+                  double best = 0;
+                  String bestS = null;
+                  while (m.find()) {
+                      String n = m.group(1).replace(",", "") + "." + m.group(2);
+                      try {
+                          double v = Double.parseDouble(n);
+                          if (v > best) { best = v; bestS = n; }
+                      } catch (NumberFormatException ignored) { }
+                  }
+                  return bestS;
+              }
+          }
+          EOF
+
+          cat > $J/Notifier.java << 'EOF'
+          package com.example.autobook;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class Notifier {
+              private static final String CH = "autobook";
+
+              public static void saved(Context ctx, Db.Tx t, String extra) {
+                  NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                  if (nm == null) return;
+                  nm.createNotificationChannel(
+                      new NotificationChannel(CH, "บันทึกอัตโนมัติ", NotificationManager.IMPORTANCE_DEFAULT));
+                  Intent i = new Intent(ctx, EditActivity.class);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  i.putExtra("id", t.id);
+                  PendingIntent pi = PendingIntent.getActivity(ctx, (int) t.id, i,
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  String title = "บันทึกแล้ว " + (t.type == 1 ? "+" : "-") + Util.money(t.amount) + " บาท · " + t.account;
+                  String text = (t.category.isEmpty() ? "ยังไม่มีหมวด (เปิดแอปให้ AI จัด)" : t.category)
+                      + (extra == null ? "" : " " + extra) + " · แตะเพื่อแก้ไข";
+                  Notification n = new Notification.Builder(ctx, CH)
+                      .setSmallIcon(android.R.drawable.ic_menu_agenda)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setAutoCancel(true)
+                      .setContentIntent(pi)
+                      .build();
+                  nm.notify((int) t.id, n);
+              }
+          }
+          EOF
+
+          cat > $J/BankNotificationService.java << 'EOF'
+          package com.example.autobook;
+
+          import android.app.Notification;
+          import android.content.ContentUris;
+          import android.database.ContentObserver;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          public class BankNotificationService extends NotificationListenerService {
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final ExecutorService bg = Executors.newSingleThreadExecutor();
+              private ContentObserver observer;
+              private long lastImageId = -1L;
+
+              @Override
+              public void onListenerConnected() {
+                  Util.debug(this, "SYSTEM: บริการเชื่อมต่อแล้ว");
+                  startImageWatch();
+              }
+
+              @Override
+              public void onListenerDisconnected() { stopImageWatch(); }
+
+              @Override
+              public void onDestroy() {
+                  stopImageWatch();
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onNotificationPosted(StatusBarNotification sbn) {
+                  if (sbn == null) return;
+                  String pkg = sbn.getPackageName();
+                  if (pkg == null || pkg.equals(getPackageName()) || !BankParser.isBank(pkg)) return;
+                  Notification n = sbn.getNotification();
+                  if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) return;
+                  Bundle ex = n.extras;
+                  if (ex == null) return;
+                  CharSequence t = ex.getCharSequence(Notification.EXTRA_TITLE);
+                  CharSequence b = ex.getCharSequence(Notification.EXTRA_BIG_TEXT);
+                  if (b == null) b = ex.getCharSequence(Notification.EXTRA_TEXT);
+                  final String title = t == null ? "" : t.toString();
+                  final String text = b == null ? "" : b.toString();
+                  final long when = sbn.getPostTime();
+                  bg.execute(() -> handleNotification(pkg, title, text, when));
+              }
+
+              private void handleNotification(String pkg, String title, String text, long when) {
+                  BankParser.Result r = BankParser.parse(pkg, title, text);
+                  Util.debug(this, (r != null ? "OK " + r.amount : "X อ่านยอดไม่ได้") + " | " + pkg + " | " + title + " | " + text);
+                  if (r == null) return;
+                  Db db = Db.get(this);
+                  if (db.duplicate(r.bank, r.amount, when - 120000L)) return;
+
+                  // slip image arrived first -> fill in the real amount
+                  Db.Tx slip = db.recent(r.bank, "slip", when - 300000L, false);
+                  if (slip != null) {
+                      slip.amount = r.amount; slip.type = r.type; slip.note = r.note;
+                      slip.source = "noti"; slip.needCat = slip.category.isEmpty();
+                      db.update(slip);
+                      Notifier.saved(this, slip, "📷");
+                      return;
+                  }
+
+                  Db.Tx x = new Db.Tx();
+                  x.ts = when; x.type = r.type; x.amount = r.amount;
+                  x.account = Util.account(r.bank); x.bank = r.bank; x.note = r.note; x.source = "noti";
+                  db.addAccount(x.account);
+                  String c = db.shopCategory(Util.key(x.note));
+                  if (c != null) x.category = c; else x.needCat = true;
+                  db.insert(x);
+                  Notifier.saved(this, x, null);
+              }
+
+              // ---------- slip images saved by bank apps ----------
+              private void startImageWatch() {
+                  if (observer != null) return;
+                  observer = new ContentObserver(handler) {
+                      @Override public void onChange(boolean selfChange, Uri uri) { checkNewImage(); }
+                  };
+                  try {
+                      getContentResolver().registerContentObserver(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer);
+                  } catch (Exception e) {
+                      Util.debug(this, "IMG watch error: " + e.getMessage());
+                  }
+              }
+
+              private void stopImageWatch() {
+                  if (observer != null) {
+                      getContentResolver().unregisterContentObserver(observer);
+                      observer = null;
+                  }
+              }
+
+              private void checkNewImage() {
+                  String[] proj = { MediaStore.Images.Media._ID, MediaStore.Images.Media.RELATIVE_PATH, MediaStore.Images.Media.DISPLAY_NAME };
+                  String sel = MediaStore.Images.Media.DATE_ADDED + " > ?";
+                  String[] args = { String.valueOf(System.currentTimeMillis() / 1000L - 120L) };
+                  try (Cursor c = getContentResolver().query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                          proj, sel, args, MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+                      if (c == null || !c.moveToFirst()) return;
+                      long id = c.getLong(0);
+                      if (id == lastImageId) return;
+                      lastImageId = id;
+                      String path = c.getString(1) == null ? "" : c.getString(1);
+                      String name = c.getString(2) == null ? "" : c.getString(2);
+                      final String bank = BankParser.bankFromPath(path + "/" + name);
+                      Util.debug(this, "IMG " + (bank == null ? "- ไม่ใช่สลิป" : "สลิป " + bank) + " | " + path + name);
+                      if (bank == null) return;
+                      final Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                      bg.execute(() -> handleSlip(bank, uri));
+                  } catch (Exception e) {
+                      Util.debug(this, "IMG error (ยังไม่ได้อนุญาตรูปภาพ?): " + e.getMessage());
+                  }
+              }
+
+              private void handleSlip(String bank, Uri uri) {
+                  try { Thread.sleep(2500L); } catch (InterruptedException ignored) { }
+                  String name;
+                  try {
+                      name = Photos.copy(this, uri);
+                  } catch (Exception e) {
+                      Util.debug(this, "IMG copy error: " + e.getMessage());
+                      return;
+                  }
+                  Db db = Db.get(this);
+                  long now = System.currentTimeMillis();
+                  String b = "SLIP".equals(bank) ? null : bank;
+
+                  // notification already saved this payment -> just attach the photo
+                  Db.Tx t = db.recent(b, "noti", now - 300000L, true);
+                  if (t != null) {
+                      t.photo = name;
+                      db.update(t);
+                      Util.debug(this, "แนบรูปสลิปกับรายการ " + Util.money(t.amount));
+                      return;
+                  }
+
+                  String amt = Slip.readAmount(this, Photos.file(this, name));
+                  Db.Tx x = new Db.Tx();
+                  x.ts = now; x.type = 0;
+                  try { x.amount = amt == null ? 0 : Double.parseDouble(amt); } catch (Exception e) { x.amount = 0; }
+                  x.account = Util.account(bank); x.bank = bank; x.note = "สลิป " + bank;
+                  x.photo = name; x.source = "slip"; x.needAi = true;
+                  db.addAccount(x.account);
+                  db.insert(x);
+                  Notifier.saved(this, x, "📷 จากสลิป (ตรวจยอด)");
+              }
+          }
+          EOF
+
+          cat > $J/Importer.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.database.sqlite.SQLiteDatabase;
+          import java.io.File;
+
+          /** Imports income/expense from a Money Manager .mmbak backup (transfers are skipped). */
+          public class Importer {
+              private static String s(String x) { return x == null ? "" : x.trim(); }
+
+              public static String run(Context c, File f) {
+                  SQLiteDatabase src = SQLiteDatabase.openDatabase(f.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+                  Db db = Db.get(c);
+                  SQLiteDatabase dst = db.getWritableDatabase();
+                  int n = 0;
+                  String sql = "SELECT i.ZDATE, CAST(i.DO_TYPE AS INTEGER), i.ZMONEY, i.ZCONTENT, a.NIC_NAME, g.NAME "
+                      + "FROM INOUTCOME i LEFT JOIN ASSETS a ON a.uid = i.assetUid "
+                      + "LEFT JOIN ZCATEGORY g ON g.uid = i.ctgUid "
+                      + "WHERE IFNULL(i.IS_DEL, 0) = 0 AND CAST(i.DO_TYPE AS INTEGER) IN (0, 1)";
+                  try (Cursor cur = src.rawQuery(sql, null)) {
+                      dst.beginTransaction();
+                      try {
+                          db.deleteSource("mm");
+                          while (cur.moveToNext()) {
+                              Db.Tx t = new Db.Tx();
+                              try {
+                                  t.ts = Long.parseLong(s(cur.getString(0)));
+                                  t.amount = Double.parseDouble(s(cur.getString(2)));
+                              } catch (Exception e) {
+                                  continue;
+                              }
+                              t.type = cur.getInt(1) == 1 ? 0 : 1;
+                              t.note = s(cur.getString(3));
+                              t.account = s(cur.getString(4));
+                              if (t.account.isEmpty()) t.account = "ไม่ระบุบัญชี";
+                              t.category = s(cur.getString(5));
+                              t.source = "mm";
+                              db.insert(t);
+                              db.addAccount(t.account);
+                              if (!t.category.isEmpty()) {
+                                  db.addCategory(t.category, t.type);
+                                  if (!t.note.isEmpty()) db.rememberShop(Util.key(t.note), t.category);
+                              }
+                              n++;
+                          }
+                          dst.setTransactionSuccessful();
+                      } finally {
+                          dst.endTransaction();
+                      }
+                  } finally {
+                      src.close();
+                  }
+                  return "นำเข้า " + n + " รายการแล้ว (ไม่รวมการโอนระหว่างบัญชี)";
+              }
+          }
+          EOF
+
+          cat > $J/EditActivity.java << 'EOF'
+          package com.example.autobook;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.DatePickerDialog;
+          import android.app.Dialog;
+          import android.app.TimePickerDialog;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Spinner;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+
+          public class EditActivity extends Activity {
+              private static final int PICK = 21;
+              private Db db;
+              private Db.Tx t;
+              private EditText amount, note;
+              private Spinner acc, cat;
+              private Button typeBtn, dateBtn;
+              private ImageView photo;
+              private Button removePhoto;
+
+              @Override
+              protected void onCreate(Bundle s) {
+                  super.onCreate(s);
+                  db = Db.get(this);
+                  long id = getIntent().getLongExtra("id", 0L);
+                  if (id > 0) t = db.get(id);
+                  if (t == null) {
+                      t = new Db.Tx();
+                      t.ts = System.currentTimeMillis();
+                      List<String> a = db.accounts();
+                      t.account = a.isEmpty() ? "Cash" : a.get(0);
+                  }
+                  setTitle(t.id > 0 ? "แก้ไขรายการ" : "เพิ่มรายการ");
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(36, 24, 36, 36);
+
+                  typeBtn = new Button(this);
+                  typeBtn.setOnClickListener(v -> {
+                      String keep = selectedCat();
+                      t.type = 1 - t.type;
+                      showType();
+                      fillCats(keep);
+                  });
+                  root.addView(label("ประเภท (แตะเพื่อสลับ)"));
+                  root.addView(typeBtn);
+
+                  root.addView(label("จำนวนเงิน (บาท)"));
+                  amount = new EditText(this);
+                  amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+                  amount.setTextSize(26f);
+                  amount.setHint("0.00");
+                  if (t.amount > 0) amount.setText(String.format(Locale.US, "%.2f", t.amount));
+                  root.addView(amount);
+
+                  root.addView(label("บัญชี"));
+                  acc = new Spinner(this);
+                  root.addView(acc);
+                  fillAccs();
+
+                  root.addView(label("หมวด"));
+                  cat = new Spinner(this);
+                  root.addView(cat);
+                  fillCats(t.category);
+                  Button addCat = new Button(this);
+                  addCat.setText("+ หมวดใหม่");
+                  addCat.setOnClickListener(v -> newCategory());
+                  root.addView(addCat);
+
+                  root.addView(label("ร้าน / บันทึก"));
+                  note = new EditText(this);
+                  note.setText(t.note);
+                  root.addView(note);
+
+                  root.addView(label("วันเวลา"));
+                  dateBtn = new Button(this);
+                  dateBtn.setOnClickListener(v -> pickDate());
+                  root.addView(dateBtn);
+
+                  root.addView(label("รูปสลิป / ใบเสร็จ"));
+                  photo = new ImageView(this);
+                  photo.setAdjustViewBounds(true);
+                  photo.setMaxHeight(900);
+                  photo.setOnClickListener(v -> showFullPhoto());
+                  root.addView(photo);
+                  LinearLayout pr = new LinearLayout(this);
+                  Button attach = new Button(this);
+                  attach.setText("📷 แนบรูป");
+                  attach.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                      i.setType("image/*");
+                      startActivityForResult(i, PICK);
+                  });
+                  pr.addView(attach);
+                  removePhoto = new Button(this);
+                  removePhoto.setText("ลบรูป");
+                  removePhoto.setOnClickListener(v -> { t.photo = ""; showPhoto(); });
+                  pr.addView(removePhoto);
+                  root.addView(pr);
+
+                  Button save = new Button(this);
+                  save.setText("💾 บันทึก");
+                  save.setTextSize(18f);
+                  save.setOnClickListener(v -> save());
+                  root.addView(save);
+
+                  if (t.id > 0) {
+                      Button del = new Button(this);
+                      del.setText("🗑 ลบรายการนี้");
+                      del.setTextColor(Color.RED);
+                      del.setOnClickListener(v -> new AlertDialog.Builder(this)
+                          .setMessage("ลบรายการนี้?")
+                          .setPositiveButton("ลบ", (d, w) -> {
+                              Photos.delete(this, t.photo);
+                              db.delete(t.id);
+                              finish();
+                          })
+                          .setNegativeButton("ยกเลิก", null)
+                          .show());
+                      root.addView(del);
+                  }
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(root);
+                  setContentView(sv);
+                  showType();
+                  showDate();
+                  showPhoto();
+              }
+
+              private TextView label(String s) {
+                  TextView tv = new TextView(this);
+                  tv.setText(s);
+                  tv.setTextColor(Color.DKGRAY);
+                  tv.setPadding(0, 24, 0, 0);
+                  return tv;
+              }
+
+              private void showType() {
+                  typeBtn.setText(t.type == 1 ? "รายรับ" : "รายจ่าย");
+                  typeBtn.setTextColor(t.type == 1 ? Color.rgb(25, 118, 210) : Color.rgb(211, 47, 47));
+              }
+
+              private void showDate() {
+                  dateBtn.setText(new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US).format(new Date(t.ts)));
+              }
+
+              private void showPhoto() {
+                  Bitmap b = t.photo.isEmpty() ? null : Photos.load(Photos.file(this, t.photo), 1200);
+                  photo.setImageBitmap(b);
+                  photo.setVisibility(b == null ? View.GONE : View.VISIBLE);
+                  removePhoto.setVisibility(b == null ? View.GONE : View.VISIBLE);
+              }
+
+              private void showFullPhoto() {
+                  if (t.photo.isEmpty()) return;
+                  Dialog d = new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+                  ImageView iv = new ImageView(this);
+                  iv.setImageBitmap(Photos.load(Photos.file(this, t.photo), 2400));
+                  iv.setOnClickListener(v -> d.dismiss());
+                  d.setContentView(iv);
+                  d.show();
+              }
+
+              private void fillAccs() {
+                  List<String> l = new ArrayList<>(db.accounts());
+                  if (!t.account.isEmpty() && !l.contains(t.account)) l.add(t.account);
+                  acc.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l));
+                  int i = l.indexOf(t.account);
+                  if (i >= 0) acc.setSelection(i);
+              }
+
+              private void fillCats(String sel) {
+                  List<String> l = new ArrayList<>();
+                  l.add("(ไม่มีหมวด)");
+                  l.addAll(db.categories(t.type));
+                  if (sel != null && !sel.isEmpty() && !l.contains(sel)) l.add(sel);
+                  cat.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l));
+                  int i = sel == null ? -1 : l.indexOf(sel);
+                  cat.setSelection(Math.max(i, 0));
+              }
+
+              private String selectedCat() {
+                  Object o = cat.getSelectedItem();
+                  String s = o == null ? "" : o.toString();
+                  return s.startsWith("(") ? "" : s;
+              }
+
+              private void newCategory() {
+                  EditText e = new EditText(this);
+                  new AlertDialog.Builder(this)
+                      .setTitle("หมวดใหม่ (" + (t.type == 1 ? "รายรับ" : "รายจ่าย") + ")")
+                      .setView(e)
+                      .setPositiveButton("เพิ่ม", (d, w) -> {
+                          String n = e.getText().toString().trim();
+                          if (n.isEmpty()) return;
+                          db.addCategory(n, t.type);
+                          fillCats(n);
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show();
+              }
+
+              private void pickDate() {
+                  final Calendar c = Calendar.getInstance();
+                  c.setTimeInMillis(t.ts);
+                  new DatePickerDialog(this, (v, y, m, d) -> {
+                      c.set(y, m, d);
+                      new TimePickerDialog(this, (v2, h, mi) -> {
+                          c.set(Calendar.HOUR_OF_DAY, h);
+                          c.set(Calendar.MINUTE, mi);
+                          t.ts = c.getTimeInMillis();
+                          showDate();
+                      }, c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), true).show();
+                  }, c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH)).show();
+              }
+
+              private void save() {
+                  double a;
+                  try {
+                      a = Double.parseDouble(amount.getText().toString().replace(",", "").trim());
+                  } catch (Exception e) {
+                      Toast.makeText(this, "ใส่จำนวนเงินก่อน", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  t.amount = a;
+                  Object ao = acc.getSelectedItem();
+                  t.account = ao == null ? "" : ao.toString();
+                  t.category = selectedCat();
+                  t.note = note.getText().toString().trim();
+                  t.needAi = false;
+                  t.needCat = false;
+                  if (t.id > 0) db.update(t);
+                  else db.insert(t);
+                  if (!t.note.isEmpty() && !t.category.isEmpty()) db.rememberShop(Util.key(t.note), t.category);
+                  finish();
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != PICK || res != RESULT_OK || data == null || data.getData() == null) return;
+                  try {
+                      t.photo = Photos.copy(this, data.getData());
+                      showPhoto();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "แนบรูปไม่ได้: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF
+
+          cat > $J/MainActivity.java << 'EOF'
+          package com.example.autobook;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ComponentName;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import android.service.notification.NotificationListenerService;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.Date;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipInputStream;
+          import java.util.zip.ZipOutputStream;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_IMPORT = 11, REQ_RESTORE = 12;
+              private static final Locale TH = new Locale("th", "TH");
+              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT;
+              private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
+              private final ExecutorService bg = Executors.newSingleThreadExecutor();
+              private final Calendar month = Calendar.getInstance();
+              private int page = 0;
+              private volatile boolean busy = false;
+              private volatile int aiStatus = -2;
+              private LinearLayout content;
+              private TextView monthLabel, totals;
+
+              @Override
+              protected void onCreate(Bundle s) {
+                  super.onCreate(s);
+                  month.set(Calendar.DAY_OF_MONTH, 1);
+                  month.set(Calendar.HOUR_OF_DAY, 0);
+                  month.set(Calendar.MINUTE, 0);
+                  month.set(Calendar.SECOND, 0);
+                  month.set(Calendar.MILLISECOND, 0);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(24, 12, 24, 0);
+
+                  LinearLayout top = new LinearLayout(this);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  top.addView(btn("◀", v -> { month.add(Calendar.MONTH, -1); render(); }));
+                  monthLabel = new TextView(this);
+                  monthLabel.setTextSize(19f);
+                  monthLabel.setGravity(Gravity.CENTER);
+                  top.addView(monthLabel, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  top.addView(btn("▶", v -> { month.add(Calendar.MONTH, 1); render(); }));
+                  root.addView(top);
+
+                  totals = new TextView(this);
+                  totals.setTextSize(14f);
+                  totals.setGravity(Gravity.CENTER);
+                  root.addView(totals);
+
+                  LinearLayout tabs = new LinearLayout(this);
+                  String[] names = { "รายการ", "สรุป", "ตั้งค่า" };
+                  for (int i = 0; i < names.length; i++) {
+                      final int p = i;
+                      tabs.addView(btn(names[i], v -> { page = p; render(); }), new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  }
+                  root.addView(tabs);
+
+                  ScrollView sv = new ScrollView(this);
+                  content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setPadding(0, 0, 0, 48);
+                  sv.addView(content);
+                  root.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+                  setContentView(root);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  render();
+                  bg.execute(() -> {
+                      aiStatus = Ai.status();
+                      runOnUiThread(this::render);
+                  });
+                  processPending();
+              }
+
+              private Button btn(String text, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setAllCaps(false);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private TextView tv(float size, String text) {
+                  TextView t = new TextView(this);
+                  t.setTextSize(size);
+                  t.setText(text);
+                  return t;
+              }
+
+              private void toast(String m) { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); }
+
+              // ---------------- screens ----------------
+              private void render() {
+                  long from = month.getTimeInMillis();
+                  Calendar e = (Calendar) month.clone();
+                  e.add(Calendar.MONTH, 1);
+                  List<Db.Tx> list = Db.get(this).range(from, e.getTimeInMillis());
+                  double inc = 0, exp = 0;
+                  for (Db.Tx t : list) { if (t.type == 1) inc += t.amount; else exp += t.amount; }
+                  monthLabel.setText(new SimpleDateFormat("MMMM yyyy", TH).format(month.getTime()));
+                  totals.setText("รายรับ " + Util.money(inc) + "   รายจ่าย " + Util.money(exp) + "   คงเหลือ " + Util.money(inc - exp));
+                  content.removeAllViews();
+                  if (page == 0) renderList(list);
+                  else if (page == 1) renderSummary(list);
+                  else renderSettings();
+              }
+
+              private void renderList(List<Db.Tx> list) {
+                  content.addView(btn("+ เพิ่มรายการเอง", v -> startActivity(new Intent(this, EditActivity.class))));
+                  if (busy) content.addView(tv(13f, "🤖 AI กำลังจัดหมวด / อ่านสลิป..."));
+                  if (list.isEmpty()) {
+                      content.addView(tv(15f, "\n(เดือนนี้ยังไม่มีรายการ)"));
+                      return;
+                  }
+                  SimpleDateFormat day = new SimpleDateFormat("EEEE d MMM", TH);
+                  SimpleDateFormat hm = new SimpleDateFormat("HH:mm", Locale.US);
+                  String last = "";
+                  for (Db.Tx t : list) {
+                      String d = day.format(new Date(t.ts));
+                      if (!d.equals(last)) {
+                          last = d;
+                          TextView h = tv(14f, "\n" + d);
+                          h.setTypeface(null, Typeface.BOLD);
+                          h.setTextColor(Color.DKGRAY);
+                          content.addView(h);
+                      }
+                      LinearLayout r = new LinearLayout(this);
+                      r.setPadding(0, 14, 0, 14);
+                      r.setGravity(Gravity.CENTER_VERTICAL);
+                      String c = !t.category.isEmpty() ? t.category : (t.needAi || t.needCat ? "🤖 รอ AI" : "❔ ไม่มีหมวด");
+                      boolean check = "slip".equals(t.source) && (t.needAi || t.amount == 0);
+                      TextView left = tv(15f, c + " · " + t.account + (t.photo.isEmpty() ? "" : " 📷")
+                          + (check ? " ⚠️ตรวจยอด" : "")
+                          + "\n" + hm.format(new Date(t.ts)) + "  " + Util.cut(t.note, 40));
+                      r.addView(left, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      TextView right = tv(16f, (t.type == 1 ? "+" : "-") + Util.money(t.amount));
+                      right.setTextColor(t.type == 1 ? Color.rgb(25, 118, 210) : Color.rgb(211, 47, 47));
+                      r.addView(right);
+                      final long id = t.id;
+                      r.setOnClickListener(v -> {
+                          Intent i = new Intent(this, EditActivity.class);
+                          i.putExtra("id", id);
+                          startActivity(i);
+                      });
+                      content.addView(r);
+                  }
+              }
+
+              private void renderSummary(List<Db.Tx> list) {
+                  Map<String, Double> byCat = new HashMap<>(), byAcc = new HashMap<>(), byInc = new HashMap<>();
+                  double exp = 0, inc = 0;
+                  for (Db.Tx t : list) {
+                      String c = t.category.isEmpty() ? "ไม่มีหมวด" : t.category;
+                      if (t.type == 0) {
+                          exp += t.amount;
+                          byCat.merge(c, t.amount, Double::sum);
+                          byAcc.merge(t.account, t.amount, Double::sum);
+                      } else {
+                          inc += t.amount;
+                          byInc.merge(c, t.amount, Double::sum);
+                      }
+                  }
+                  section("รายจ่ายตามหมวด", byCat, exp, Color.rgb(211, 47, 47));
+                  section("รายจ่ายตามบัญชี", byAcc, exp, Color.rgb(211, 47, 47));
+                  section("รายรับ", byInc, inc, Color.rgb(25, 118, 210));
+              }
+
+              private void section(String title, Map<String, Double> m, double total, int color) {
+                  TextView h = tv(16f, "\n" + title + "  (" + Util.money(total) + ")");
+                  h.setTypeface(null, Typeface.BOLD);
+                  content.addView(h);
+                  if (m.isEmpty()) { content.addView(tv(14f, "-")); return; }
+                  List<Map.Entry<String, Double>> l = new ArrayList<>(m.entrySet());
+                  l.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+                  double max = l.get(0).getValue();
+                  for (Map.Entry<String, Double> en : l) {
+                      int bars = max <= 0 ? 0 : (int) Math.round(en.getValue() / max * 18);
+                      StringBuilder sb = new StringBuilder();
+                      for (int i = 0; i < Math.max(bars, 1); i++) sb.append('█');
+                      int pct = total <= 0 ? 0 : (int) Math.round(en.getValue() * 100 / total);
+                      TextView a = tv(14f, en.getKey() + "   " + Util.money(en.getValue()) + "  (" + pct + "%)");
+                      a.setPadding(0, 10, 0, 0);
+                      content.addView(a);
+                      TextView bar = tv(10f, sb.toString());
+                      bar.setTextColor(color);
+                      content.addView(bar);
+                  }
+              }
+
+              private void renderSettings() {
+                  content.addView(tv(15f, "\nอ่านแจ้งเตือนธนาคาร: " + (listenerEnabled() ? "✅" : "❌ (กดปุ่ม 1)")
+                      + "\nเก็บรูปสลิปอัตโนมัติ: " + (imagesAllowed() ? "✅" : "❌ (กดปุ่ม 2)")
+                      + "\nAI ในเครื่อง: " + (aiStatus == -2 ? "กำลังตรวจ..." : Ai.statusText(aiStatus))));
+
+                  content.addView(btn("1. เปิดสิทธิ์อ่านการแจ้งเตือน", v ->
+                      startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))));
+                  content.addView(btn("2. อนุญาตแจ้งเตือน + รูปภาพ", v -> {
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.READ_MEDIA_IMAGES }, 1);
+                      } else {
+                          requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE }, 1);
+                      }
+                  }));
+                  content.addView(btn("3. เชื่อมต่อบริการใหม่", v -> {
+                      NotificationListenerService.requestRebind(new ComponentName(this, BankNotificationService.class));
+                      toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
+                  }));
+                  content.addView(btn("4. ตรวจ / ดาวน์โหลด AI ในเครื่อง", v -> setupAi()));
+
+                  content.addView(tv(16f, "\nข้อมูล"));
+                  content.addView(btn("📥 นำเข้าจาก Money Manager (.mmbak)", v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.addCategory(Intent.CATEGORY_OPENABLE);
+                      i.setType("*/*");
+                      startActivityForResult(i, REQ_IMPORT);
+                  }));
+                  content.addView(btn("💾 สำรองข้อมูล + รูป (ไปที่ Download/AutoBook)", v -> backup()));
+                  content.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
+                      .setMessage("ข้อมูลปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรอง ดำเนินการต่อ?")
+                      .setPositiveButton("กู้คืน", (d, w) -> {
+                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          startActivityForResult(i, REQ_RESTORE);
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show()));
+                  content.addView(btn("ทดสอบ: เพิ่มรายจ่าย 150.00 (กรุงไทย)", v -> {
+                      Db.Tx t = new Db.Tx();
+                      t.ts = System.currentTimeMillis(); t.amount = 150; t.account = "กรุงไทย";
+                      t.note = "7-Eleven ทดสอบ"; t.source = "test"; t.needCat = true;
+                      Db.get(this).insert(t);
+                      Notifier.saved(this, t, null);
+                      processPending();
+                      render();
+                  }));
+
+                  String d = Util.debugLog(this);
+                  TextView dbg = tv(11f, "\n=== debug ===\n" + (d.isEmpty() ? "(ยังไม่มี)" : d));
+                  dbg.setTextColor(Color.GRAY);
+                  dbg.setTextIsSelectable(true);
+                  content.addView(dbg);
+              }
+
+              private boolean listenerEnabled() {
+                  String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+                  return flat != null && flat.contains(getPackageName());
+              }
+
+              private boolean imagesAllowed() {
+                  String perm = Build.VERSION.SDK_INT >= 33 ? Manifest.permission.READ_MEDIA_IMAGES : Manifest.permission.READ_EXTERNAL_STORAGE;
+                  return checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              // ---------------- AI ----------------
+              private void setupAi() {
+                  toast("กำลังตรวจ AI...");
+                  bg.execute(() -> {
+                      aiStatus = Ai.status();
+                      runOnUiThread(() -> {
+                          render();
+                          if (Ai.downloadable(aiStatus)) {
+                              Ai.download(msg -> runOnUiThread(() -> {
+                                  toast(msg);
+                                  if (msg.contains("✅")) onResume();
+                              }));
+                          } else {
+                              toast("AI: " + Ai.statusText(aiStatus));
+                          }
+                      });
+                  });
+              }
+
+              private void processPending() {
+                  if (busy) return;
+                  busy = true;
+                  bg.execute(() -> {
+                      try {
+                          Db db = Db.get(this);
+                          List<Db.Tx> list = db.pending();
+                          if (list.isEmpty()) return;
+                          boolean ai = Ai.ready();
+                          for (Db.Tx t : list) {
+                              List<String> cats = db.categories(t.type);
+                              try {
+                                  if (t.needAi) {
+                                      if (!ai) continue;
+                                      String[] r = t.photo.isEmpty() ? null : Ai.readSlip(Photos.file(this, t.photo), cats);
+                                      if (r != null) {
+                                          if ("slip".equals(t.source)) {
+                                              try { t.amount = Double.parseDouble(r[0]); } catch (Exception ignored) { }
+                                          }
+                                          if ((t.note.isEmpty() || t.note.startsWith("สลิป")) && !r[1].isEmpty()) t.note = r[1];
+                                          if (t.category.isEmpty()) t.category = r[2];
+                                      }
+                                      t.needAi = false;
+                                      t.needCat = t.category.isEmpty() && !t.note.startsWith("สลิป");
+                                  }
+                                  if (t.needCat) {
+                                      String c = db.shopCategory(Util.key(t.note));
+                                      if (c == null && ai) c = Ai.categorize(t.note, cats);
+                                      if (c != null) { t.category = c; t.needCat = false; }
+                                  }
+                                  db.update(t);
+                              } catch (Exception e) {
+                                  Util.debug(this, "AI error: " + e.getMessage());
+                                  t.needAi = false;
+                                  t.needCat = false;
+                                  db.update(t);
+                              }
+                              runOnUiThread(this::render);
+                          }
+                      } finally {
+                          busy = false;
+                          runOnUiThread(this::render);
+                      }
+                  });
+              }
+
+              // ---------------- import / backup / restore ----------------
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (res != RESULT_OK || data == null || data.getData() == null) return;
+                  Uri u = data.getData();
+                  if (req == REQ_IMPORT) importMm(u);
+                  else if (req == REQ_RESTORE) restore(u);
+              }
+
+              private void importMm(Uri u) {
+                  toast("กำลังนำเข้า...");
+                  bg.execute(() -> {
+                      String msg;
+                      try {
+                          File f = new File(getCacheDir(), "import.mmbak");
+                          try (InputStream in = getContentResolver().openInputStream(u);
+                               OutputStream out = new FileOutputStream(f)) {
+                              if (in == null) throw new IOException("เปิดไฟล์ไม่ได้");
+                              Photos.copy(in, out);
+                          }
+                          msg = Importer.run(this, f);
+                          f.delete();
+                      } catch (Exception e) {
+                          msg = "นำเข้าไม่สำเร็จ: " + e.getMessage();
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> { toast(m); page = 0; render(); });
+                  });
+              }
+
+              private void zipFile(ZipOutputStream z, File f, String name) throws IOException {
+                  if (!f.exists()) return;
+                  z.putNextEntry(new ZipEntry(name));
+                  try (InputStream in = new FileInputStream(f)) { Photos.copy(in, z); }
+                  z.closeEntry();
+              }
+
+              private void backup() {
+                  toast("กำลังสำรองข้อมูล...");
+                  bg.execute(() -> {
+                      String msg;
+                      try {
+                          String name = "AutoBook-" + new SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(new Date()) + ".zip";
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                          v.put(MediaStore.Downloads.MIME_TYPE, "application/zip");
+                          v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AutoBook");
+                          Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                          if (u == null) throw new IOException("สร้างไฟล์ไม่ได้");
+                          synchronized (Db.get(this)) {
+                              try (OutputStream os = getContentResolver().openOutputStream(u);
+                                   ZipOutputStream z = new ZipOutputStream(os)) {
+                                  zipFile(z, getDatabasePath("book.db"), "book.db");
+                                  File[] ps = Photos.dir(this).listFiles();
+                                  if (ps != null) for (File p : ps) zipFile(z, p, "photos/" + p.getName());
+                              }
+                          }
+                          msg = "สำรองแล้ว: Download/AutoBook/" + name;
+                      } catch (Exception e) {
+                          msg = "สำรองไม่สำเร็จ: " + e.getMessage();
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> toast(m));
+                  });
+              }
+
+              private void restore(Uri u) {
+                  toast("กำลังกู้คืน...");
+                  bg.execute(() -> {
+                      String msg;
+                      try {
+                          File tmp = new File(getCacheDir(), "restore.db");
+                          File tmpPhotos = new File(getCacheDir(), "restore_photos");
+                          tmpPhotos.mkdirs();
+                          boolean got = false;
+                          try (InputStream in = getContentResolver().openInputStream(u);
+                               ZipInputStream z = new ZipInputStream(in)) {
+                              ZipEntry e;
+                              while ((e = z.getNextEntry()) != null) {
+                                  String n = e.getName();
+                                  File out = null;
+                                  if (n.equals("book.db")) { out = tmp; got = true; }
+                                  else if (n.startsWith("photos/") && !e.isDirectory()) out = new File(tmpPhotos, new File(n).getName());
+                                  if (out != null) {
+                                      try (FileOutputStream fo = new FileOutputStream(out)) { Photos.copy(z, fo); }
+                                  }
+                              }
+                          }
+                          if (!got) throw new IOException("ไม่ใช่ไฟล์สำรองของ AutoBook");
+                          Db.reset();
+                          File dbf = getDatabasePath("book.db");
+                          try (InputStream in = new FileInputStream(tmp); OutputStream out = new FileOutputStream(dbf)) {
+                              Photos.copy(in, out);
+                          }
+                          new File(dbf.getPath() + "-journal").delete();
+                          File[] ps = tmpPhotos.listFiles();
+                          if (ps != null) for (File p : ps) {
+                              try (InputStream in = new FileInputStream(p);
+                                   OutputStream out = new FileOutputStream(Photos.file(this, p.getName()))) {
+                                  Photos.copy(in, out);
+                              }
+                              p.delete();
+                          }
+                          tmp.delete();
+                          msg = "กู้คืนเรียบร้อย ✅";
+                      } catch (Exception e) {
+                          msg = "กู้คืนไม่สำเร็จ: " + e.getMessage();
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> { toast(m); render(); });
+                  });
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          set -o pipefail
+          cd /tmp/ab
+          gradle assembleDebug --console=plain 2>&1 | tee /tmp/build.log
+
+      - name: Show real errors (only if build failed)
+        if: failure()
+        run: |
+          echo "=========== ERRORS ==========="
+          grep -n -i -E "error:|what went wrong|cannot find symbol|cannot access|duplicate class|requires|minCompileSdk" -A 4 /tmp/build.log | head -n 80 || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoBook-APK
+          path: /tmp/ab/app/build/outputs/apk/debug/app-debug.apk
