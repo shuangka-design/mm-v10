@@ -1,4 +1,4 @@
-name: Build MM AutoBridge APK (v14 AI slip + quick save)
+name: Build MM AutoBridge APK (v15 open MM input screen)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.mmbridge"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 14
-                  versionName = "14.0"
+                  versionCode = 15
+                  versionName = "15.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -72,10 +72,8 @@ jobs:
               }
           }
           dependencies {
-              // on-device Gemini Nano (Thai slip reading + categories)
               implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
               implementation("com.google.guava:guava:33.3.1-android")
-              // fallback OCR (numbers only) when AI is not ready
               implementation("com.google.mlkit:text-recognition:16.0.1")
               implementation("com.google.android.gms:play-services-tasks:18.2.0")
               implementation(platform("org.jetbrains.kotlin:kotlin-bom:2.1.0"))
@@ -132,7 +130,6 @@ jobs:
           import java.util.List;
           import java.util.Locale;
 
-          /** Simple list of transactions stored in SharedPreferences. */
           public class Store {
               private static final String PREF = "mm_bridge";
               private static final String ITEMS = "items";
@@ -141,17 +138,21 @@ jobs:
 
               public static class Item {
                   public String id = "", time = "", bank = "", amount = "", shop = "", cat = "", uri = "";
-                  public String status = "N";   // N = waiting to enter in Money Manager, D = done
-                  public boolean needAi = false; // slip image waiting for AI to read
+                  public String status = "N";
+                  public boolean needAi = false;
               }
 
-              private static SharedPreferences p(Context c) {
+              static SharedPreferences p(Context c) {
                   return c.getSharedPreferences(PREF, Context.MODE_PRIVATE);
               }
 
               private static String clean(String s) {
                   return s == null ? "" : s.replace(SEP, " ").replace("\t", " ").replace("\n", " ").trim();
               }
+
+              /** Money Manager "current_tab" value for expense (found by testing) */
+              public static int tab(Context c) { return p(c).getInt("mmTab", 1); }
+              public static void setTab(Context c, int t) { p(c).edit().putInt("mmTab", t).commit(); }
 
               public static synchronized List<Item> list(Context c) {
                   List<Item> out = new ArrayList<>();
@@ -171,7 +172,7 @@ jobs:
 
               private static void save(Context c, List<Item> items) {
                   StringBuilder sb = new StringBuilder();
-                  int start = Math.max(0, items.size() - 100); // keep last 100
+                  int start = Math.max(0, items.size() - 100);
                   for (int i = start; i < items.size(); i++) {
                       Item it = items.get(i);
                       if (sb.length() > 0) sb.append("\n");
@@ -184,7 +185,6 @@ jobs:
                   p(c).edit().putString(ITEMS, sb.toString()).commit();
               }
 
-              /** Returns new item id, or null if same amount was added in the last 2 minutes. */
               public static synchronized String add(Context c, String bank, String amount, String shop,
                                                     String cat, String uri, boolean needAi) {
                   long now = System.currentTimeMillis();
@@ -272,6 +272,15 @@ jobs:
                   BANKS.put("th.co.truemoney.wallet", "TrueMoney");
               }
 
+              /** bank label -> Money Manager account uid (from your backup file) */
+              public static final Map<String, String> MM_ACCOUNT = new HashMap<>();
+              static {
+                  MM_ACCOUNT.put("KTB", "1dd5f9be-4441-4363-9714-5772cc87425c");   // กรุงไทย
+                  MM_ACCOUNT.put("KMA", "675ed171-6de6-4a3d-9f74-bca6c2d558ce");   // กรุงศรี
+                  MM_ACCOUNT.put("GSB", "046bb45a-e369-4ed9-a2f6-099d4f80bec4");   // ออมสิน
+                  MM_ACCOUNT.put("TEST", "1dd5f9be-4441-4363-9714-5772cc87425c");  // test -> กรุงไทย
+              }
+
               private static final String[][] FOLDERS = {
                   { "krungthai", "KTB" }, { "ktb", "KTB" },
                   { "bualuang", "BBL" }, { "bangkok bank", "BBL" }, { "bbl", "BBL" },
@@ -297,7 +306,6 @@ jobs:
                   return null;
               }
 
-              /** returns {bank, amount, note} or null */
               public static String[] parse(String pkg, String title, String text) {
                   String bank = BANKS.get(pkg);
                   if (bank == null) return null;
@@ -342,7 +350,6 @@ jobs:
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
 
-          /** On-device Gemini Nano. Must be called from a background thread, while the app is on screen. */
           public class Ai {
               public static final String[] CATS = {
                   "อาหาร", "เดินทาง", "ช้อปปิ้ง", "บิล/ค่าบริการ", "สุขภาพ", "บันเทิง", "โอนเงิน", "อื่นๆ"
@@ -369,20 +376,15 @@ jobs:
                   return model;
               }
 
-              /** returns FeatureStatus value, or -1 on error */
               public static int status() {
-                  try {
-                      return m().checkStatus().get();
-                  } catch (Exception e) {
-                      return -1;
-                  }
+                  try { return m().checkStatus().get(); } catch (Exception e) { return -1; }
               }
 
               public static boolean ready() { return status() == FeatureStatus.AVAILABLE; }
 
               public static String statusText(int s) {
                   if (s == FeatureStatus.AVAILABLE) return "พร้อมใช้ ✅";
-                  if (s == FeatureStatus.DOWNLOADABLE) return "ยังไม่ได้ดาวน์โหลด (กดปุ่ม AI)";
+                  if (s == FeatureStatus.DOWNLOADABLE) return "ยังไม่ได้ดาวน์โหลด (กดปุ่ม 4)";
                   if (s == FeatureStatus.DOWNLOADING) return "กำลังดาวน์โหลด...";
                   if (s == FeatureStatus.UNAVAILABLE) return "เครื่องนี้ยังใช้ไม่ได้ ❌";
                   return "ตรวจสอบไม่ได้ ❌";
@@ -420,7 +422,6 @@ jobs:
                   });
               }
 
-              /** returns {amount, shop, cat} or null */
               public static String[] readSlip(Context c, Uri uri) throws Exception {
                   Bitmap bmp = load(c, uri);
                   GenerateContentRequest.Builder b = new GenerateContentRequest.Builder(
@@ -466,7 +467,6 @@ jobs:
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
 
-          /** Fallback OCR: numbers only, picks the largest 2-decimal number. */
           public class Slip {
               public interface Result { void done(String amount, String error); }
 
@@ -575,7 +575,7 @@ jobs:
                   if (sbn == null) return;
                   String pkg = sbn.getPackageName();
                   if (pkg == null || pkg.equals(getPackageName())) return;
-                  if (!BankParser.isBank(pkg)) {           // privacy: package name only
+                  if (!BankParser.isBank(pkg)) {
                       Store.debug(this, "- " + pkg);
                       return;
                   }
@@ -593,11 +593,10 @@ jobs:
 
                   String id = Store.add(this, r[0], r[1], r[2], "", "", false);
                   if (id != null) {
-                      notifyItem(this, id, r[0] + " จ่าย " + r[1] + " บาท", "แตะเพื่อคัดลอกยอดและเปิด Money Manager");
+                      notifyItem(this, id, r[0] + " จ่าย " + r[1] + " บาท", "แตะเพื่อเปิดหน้าเพิ่มรายการใน Money Manager");
                   }
               }
 
-              // ---------- slip images saved by bank apps ----------
               private void startImageWatch() {
                   if (observer != null) return;
                   observer = new ContentObserver(handler) {
@@ -630,14 +629,13 @@ jobs:
                       Store.debug(this, "IMG " + (bank == null ? "- ไม่ใช่สลิป" : "สลิป " + bank) + " | " + path + name);
                       if (bank == null) return;
                       final Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
-                      // Background: quick number OCR now; AI re-reads Thai text when you open the app
                       handler.postDelayed(() -> Slip.read(this, uri, (amount, err) -> {
                           String itemId = Store.add(this, bank, amount == null ? "" : amount,
                               "สลิป " + bank, "", uri.toString(), true);
                           if (itemId == null) return;
                           notifyItem(this, itemId,
                               amount == null ? "พบสลิป " + bank : "สลิป " + bank + " " + amount + " บาท",
-                              "เปิดแอปให้ AI ตรวจยอด หรือแตะเพื่อคัดลอกยอด");
+                              "เปิดแอปให้ AI ตรวจยอด หรือแตะเพื่อบันทึก");
                       }), 1500L);
                   } catch (Exception e) {
                       Store.debug(this, "IMG error (ยังไม่ได้อนุญาตรูปภาพ?): " + e.getMessage());
@@ -652,34 +650,67 @@ jobs:
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.ClipboardManager;
+          import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
           import android.os.Bundle;
           import android.widget.Toast;
 
           public class QuickBridgeActivity extends Activity {
-              /** Copies the amount, marks the item done and opens Money Manager. */
-              static void openMM(Context ctx, String id) {
-                  Store.Item it = Store.get(ctx, id);
-                  if (it != null && !it.amount.isEmpty()) {
-                      ClipboardManager cb = ctx.getSystemService(ClipboardManager.class);
-                      if (cb != null) cb.setPrimaryClip(ClipData.newPlainText("amount", it.amount));
-                      String extra = (it.cat.isEmpty() ? "" : " | " + it.cat) + (it.shop.isEmpty() ? "" : " | " + it.shop);
-                      Toast.makeText(ctx, "คัดลอก " + it.amount + " บาทแล้ว" + extra + "\nกด + แล้ววางในช่องจำนวนเงิน",
-                          Toast.LENGTH_LONG).show();
-                      Store.markDone(ctx, id);
-                  } else {
-                      Toast.makeText(ctx, "ยังไม่มียอด เปิดแอป MM AutoBridge ให้ AI อ่านสลิปก่อน", Toast.LENGTH_LONG).show();
-                      return;
+              static final String MM_FREE = "com.realbyteapps.moneymanagerfree";
+              static final String MM_PRO = "com.realbyteapps.moneymanager";
+              static final String MM_INPUT = "com.realbyte.money.ui.inputUi.InputSaveContinue";
+
+              /**
+               * Opens Money Manager's add-transaction screen directly (same way as the
+               * Automate community flow). Account + tab are passed as extras.
+               * Amount cannot be passed this way, so it is copied to the clipboard.
+               */
+              static boolean openInput(Context ctx, String accountUid, int tab) {
+                  String[] pkgs = { MM_FREE, MM_PRO };
+                  for (String pkg : pkgs) {
+                      if (ctx.getPackageManager().getLaunchIntentForPackage(pkg) == null) continue;
+                      Intent i = new Intent();
+                      i.setComponent(new ComponentName(pkg, MM_INPUT));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                      i.putExtra("activityCode", 15);
+                      if (accountUid != null) i.putExtra("account_id", accountUid);
+                      i.putExtra("current_tab", tab);
+                      try {
+                          ctx.startActivity(i);
+                          Store.debug(ctx, "MM input เปิดได้ | tab=" + tab + " | account=" + accountUid);
+                          return true;
+                      } catch (Exception e) {
+                          Store.debug(ctx, "MM input เปิดไม่ได้: " + e.getClass().getSimpleName() + " " + e.getMessage());
+                      }
                   }
-                  Intent mm = ctx.getPackageManager().getLaunchIntentForPackage("com.realbyteapps.moneymanagerfree");
-                  if (mm == null) mm = ctx.getPackageManager().getLaunchIntentForPackage("com.realbyteapps.moneymanager");
+                  // fallback: just open the app
+                  Intent mm = ctx.getPackageManager().getLaunchIntentForPackage(MM_FREE);
+                  if (mm == null) mm = ctx.getPackageManager().getLaunchIntentForPackage(MM_PRO);
                   if (mm != null) {
                       mm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                       ctx.startActivity(mm);
                   } else {
                       Toast.makeText(ctx, "ไม่พบแอป Money Manager", Toast.LENGTH_SHORT).show();
                   }
+                  return false;
+              }
+
+              static void openMM(Context ctx, String id) {
+                  Store.Item it = Store.get(ctx, id);
+                  if (it == null || it.amount.isEmpty()) {
+                      Toast.makeText(ctx, "ยังไม่มียอด เปิดแอป MM AutoBridge ให้ AI อ่านสลิปก่อน", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  ClipboardManager cb = ctx.getSystemService(ClipboardManager.class);
+                  if (cb != null) cb.setPrimaryClip(ClipData.newPlainText("amount", it.amount));
+                  String acc = BankParser.MM_ACCOUNT.get(it.bank);
+                  boolean direct = openInput(ctx, acc, Store.tab(ctx));
+                  String extra = (it.cat.isEmpty() ? "" : " | " + it.cat) + (it.shop.isEmpty() ? "" : " | " + it.shop);
+                  Toast.makeText(ctx, "คัดลอก " + it.amount + " บาทแล้ว" + extra
+                      + (direct ? "\nกดค้างช่องจำนวนเงิน → วาง แล้วกดบันทึก" : "\nกด + แล้ววางในช่องจำนวนเงิน"),
+                      Toast.LENGTH_LONG).show();
+                  Store.markDone(ctx, id);
               }
 
               @Override
@@ -688,7 +719,6 @@ jobs:
                   String id = getIntent().getStringExtra("id");
                   Store.Item it = id == null ? null : Store.get(this, id);
                   if (it != null && it.amount.isEmpty()) {
-                      // slip without amount yet -> open main app so AI can read it
                       Intent main = new Intent(this, MainActivity.class);
                       main.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                       startActivity(main);
@@ -725,6 +755,7 @@ jobs:
 
           public class MainActivity extends Activity {
               private static final int PICK_SLIP = 7;
+              private static final String KTB = "1dd5f9be-4441-4363-9714-5772cc87425c";
               private final ExecutorService bg = Executors.newSingleThreadExecutor();
               private volatile boolean busy = false;
               private volatile int aiStatus = -2;
@@ -757,6 +788,25 @@ jobs:
                   listBox.setOrientation(LinearLayout.VERTICAL);
                   root.addView(listBox);
 
+                  TextView tabHead = new TextView(this);
+                  tabHead.setText("\nทดสอบหน้าเพิ่มรายการ (บัญชีกรุงไทย)\nกดทีละปุ่ม แล้วดูว่าปุ่มไหนเปิดแท็บ \"รายจ่าย\" จากนั้นกด \"ใช้ค่านี้\"");
+                  tabHead.setTextSize(15f);
+                  root.addView(tabHead);
+                  for (int t = 0; t <= 2; t++) {
+                      final int tab = t;
+                      LinearLayout row = new LinearLayout(this);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      Button test = new Button(this);
+                      test.setText("เปิด tab " + tab);
+                      test.setOnClickListener(v -> QuickBridgeActivity.openInput(this, KTB, tab));
+                      row.addView(test);
+                      Button use = new Button(this);
+                      use.setText("ใช้ค่านี้");
+                      use.setOnClickListener(v -> { Store.setTab(this, tab); toast("ตั้งรายจ่าย = tab " + tab); refresh(); });
+                      row.addView(use);
+                      root.addView(row);
+                  }
+
                   TextView setup = new TextView(this);
                   setup.setText("\nตั้งค่า / ทดสอบ");
                   setup.setTextSize(17f);
@@ -776,7 +826,7 @@ jobs:
                       toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
                   });
                   addButton(root, "4. ตรวจ / ดาวน์โหลด AI ในเครื่อง", this::setupAi);
-                  addButton(root, "ทดสอบ: เพิ่มรายการ 150.00", () -> {
+                  addButton(root, "ทดสอบ: เพิ่มรายการ 150.00 (กรุงไทย)", () -> {
                       Store.add(this, "TEST", "150.00", "7-Eleven ทดสอบ", "", "", false);
                       refresh();
                       processPending();
@@ -805,7 +855,6 @@ jobs:
                   });
               }
 
-              // ---------- AI work on items (app must be on screen) ----------
               private void processPending() {
                   if (busy) return;
                   busy = true;
@@ -881,7 +930,6 @@ jobs:
                               toast("AI อ่านได้ " + fr[0] + " บาท | " + fr[2] + " | " + fr[1]);
                               refresh();
                           } else {
-                              // fallback: number-only OCR
                               Store.debug(this, "AI อ่านไม่ได้ (" + ferr + ") ใช้ OCR สำรอง");
                               Slip.read(this, uri, (amount, e2) -> {
                                   if (amount == null) { toast(e2); return; }
@@ -894,7 +942,6 @@ jobs:
                   });
               }
 
-              // ---------- UI ----------
               private boolean listenerEnabled() {
                   String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
                   return flat != null && flat.contains(getPackageName());
@@ -909,6 +956,7 @@ jobs:
                   status.setText("อ่านแจ้งเตือน: " + (listenerEnabled() ? "✅" : "❌ (กดปุ่ม 1)")
                       + "\nอ่านรูปสลิปอัตโนมัติ: " + (imagesAllowed() ? "✅" : "❌ (กดปุ่ม 2)")
                       + "\nAI ในเครื่อง: " + (aiStatus == -2 ? "กำลังตรวจ..." : Ai.statusText(aiStatus))
+                      + "\nแท็บรายจ่ายใน Money Manager: tab " + Store.tab(this)
                       + (busy ? "\n🤖 AI กำลังทำงาน..." : ""));
 
                   listBox.removeAllViews();
@@ -921,7 +969,8 @@ jobs:
                       TextView tv = new TextView(this);
                       tv.setTextSize(15f);
                       tv.setPadding(0, 20, 0, 4);
-                      tv.setText("[" + it.time + "] " + it.bank + "  "
+                      String acc = BankParser.MM_ACCOUNT.containsKey(it.bank) ? "" : " (เลือกบัญชีเอง)";
+                      tv.setText("[" + it.time + "] " + it.bank + acc + "  "
                           + (it.amount.isEmpty() ? "ยังไม่มียอด" : it.amount + " บาท")
                           + "\n" + (it.cat.isEmpty() ? "🤖 รอ AI จัดหมวด" : it.cat)
                           + (it.needAi ? " (🤖 รอ AI ตรวจสลิป)" : "")
@@ -931,7 +980,7 @@ jobs:
                       LinearLayout row = new LinearLayout(this);
                       row.setOrientation(LinearLayout.HORIZONTAL);
                       Button save = new Button(this);
-                      save.setText("คัดลอก + เปิดหมูแดง");
+                      save.setText("บันทึกใน Money Manager");
                       save.setEnabled(!it.amount.isEmpty());
                       save.setOnClickListener(v -> QuickBridgeActivity.openMM(this, it.id));
                       row.addView(save);
