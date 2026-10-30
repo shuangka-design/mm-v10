@@ -1,4 +1,4 @@
-name: Build MM AutoBridge APK (v11 debug)
+name: Build MM AutoBridge APK (v13 slip OCR)
 
 on:
   push:
@@ -49,6 +49,7 @@ jobs:
 
           cat > gradle.properties << 'EOF'
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
           EOF
 
           cat > app/build.gradle.kts << 'EOF'
@@ -62,13 +63,18 @@ jobs:
                   applicationId = "com.example.mmbridge"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 11
-                  versionName = "11.0-debug"
+                  versionCode = 13
+                  versionName = "13.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
+          }
+          dependencies {
+              implementation("com.google.mlkit:text-recognition:16.0.0")
+              implementation("com.google.android.gms:play-services-tasks:18.0.2")
+              implementation(platform("org.jetbrains.kotlin:kotlin-bom:1.8.22"))
           }
           EOF
 
@@ -76,6 +82,8 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <queries>
                   <package android:name="com.realbyteapps.moneymanagerfree" />
                   <package android:name="com.realbyteapps.moneymanager" />
@@ -138,7 +146,18 @@ jobs:
                   p(ctx).edit().putString(KEY, old.isEmpty() ? row : old + "\n" + row).commit();
               }
 
-              public static void debug(Context ctx, String line) {
+              /** Adds only if the same amount was not recorded in the last 2 minutes. */
+              public static synchronized boolean addIfNew(Context ctx, String bank, String amount, String note) {
+                  long now = System.currentTimeMillis();
+                  String lastAmt = p(ctx).getString("lastAmt", "");
+                  long lastTime = p(ctx).getLong("lastTime", 0L);
+                  if (amount.equals(lastAmt) && now - lastTime < 120000L) return false;
+                  p(ctx).edit().putString("lastAmt", amount).putLong("lastTime", now).commit();
+                  add(ctx, bank, amount, note);
+                  return true;
+              }
+
+              public static synchronized void debug(Context ctx, String line) {
                   String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
                   String entry = "[" + time + "] " + clean(line);
                   String old = p(ctx).getString(DBG, "");
@@ -156,7 +175,7 @@ jobs:
               public static String debugLog(Context ctx) { return p(ctx).getString(DBG, ""); }
 
               public static void clear(Context ctx) {
-                  p(ctx).edit().remove(KEY).remove(DBG).commit();
+                  p(ctx).edit().remove(KEY).remove(DBG).remove("lastAmt").remove("lastTime").commit();
               }
 
               public static String tsv(Context ctx) {
@@ -187,6 +206,16 @@ jobs:
                   BANKS.put("th.co.truemoney.wallet", "TrueMoney");
               }
 
+              /** keyword in image folder/file name -> bank label */
+              private static final String[][] FOLDERS = {
+                  { "krungthai", "KTB" }, { "ktb", "KTB" },
+                  { "bualuang", "BBL" }, { "bangkok bank", "BBL" }, { "bbl", "BBL" },
+                  { "krungsri", "KMA" }, { "kma", "KMA" },
+                  { "mymo", "GSB" }, { "gsb", "GSB" },
+                  { "truemoney", "TrueMoney" },
+                  { "slip", "SLIP" }
+              };
+
               private static final String[] IGNORE = { "เงินเข้า", "OTP" };
 
               private static final String NUM = "([0-9][0-9,]*(?:\\.[0-9]{1,2})?)";
@@ -196,6 +225,14 @@ jobs:
                   "(?:THB|฿|จำนวนเงิน|จำนวน|ยอดเงิน|ยอด)\\s*:?\\s*-?" + NUM, Pattern.CASE_INSENSITIVE);
 
               public static boolean isBank(String pkg) { return BANKS.containsKey(pkg); }
+
+              public static String bankFromPath(String path) {
+                  String l = path.toLowerCase(Locale.ROOT);
+                  for (String[] f : FOLDERS) {
+                      if (l.contains(f[0])) return f[1];
+                  }
+                  return null;
+              }
 
               /** returns {bank, amount, note} or null */
               public static String[] parse(String pkg, String title, String text) {
@@ -226,6 +263,65 @@ jobs:
           }
           EOF
 
+          cat > $J/Slip.java << 'EOF'
+          package com.example.mmbridge;
+
+          import android.content.Context;
+          import android.net.Uri;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class Slip {
+              public interface Result {
+                  void done(String amount, String error);
+              }
+
+              private static TextRecognizer recognizer;
+
+              // numbers with exactly 2 decimals, e.g. 150.00 or 1,250.50 (not dates like 30.10.2026)
+              private static final Pattern MONEY = Pattern.compile(
+                  "(?<![0-9.,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\\.([0-9]{2})(?![0-9]|\\.[0-9])");
+
+              public static void read(Context ctx, Uri uri, Result cb) {
+                  InputImage img;
+                  try {
+                      img = InputImage.fromFilePath(ctx, uri);
+                  } catch (Exception e) {
+                      cb.done(null, "เปิดรูปไม่ได้: " + e.getMessage());
+                      return;
+                  }
+                  if (recognizer == null) {
+                      recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                  }
+                  recognizer.process(img)
+                      .addOnSuccessListener(text -> {
+                          String a = pick(text.getText());
+                          cb.done(a, a == null ? "หายอดเงินในรูปไม่เจอ" : null);
+                      })
+                      .addOnFailureListener(e -> cb.done(null, "อ่านรูปผิดพลาด: " + e.getMessage()));
+              }
+
+              /** picks the largest 2-decimal number (fee 0.00 is ignored) */
+              static String pick(String s) {
+                  Matcher m = MONEY.matcher(s);
+                  double best = 0;
+                  String bestS = null;
+                  while (m.find()) {
+                      String n = m.group(1).replace(",", "") + "." + m.group(2);
+                      try {
+                          double v = Double.parseDouble(n);
+                          if (v > best) { best = v; bestS = n; }
+                      } catch (NumberFormatException ignored) { }
+                  }
+                  return bestS;
+              }
+          }
+          EOF
+
           cat > $J/BankNotificationService.java << 'EOF'
           package com.example.mmbridge;
 
@@ -233,32 +329,77 @@ jobs:
           import android.app.NotificationChannel;
           import android.app.NotificationManager;
           import android.app.PendingIntent;
+          import android.content.ContentUris;
+          import android.content.Context;
           import android.content.Intent;
+          import android.database.ContentObserver;
+          import android.database.Cursor;
+          import android.net.Uri;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
           import android.service.notification.NotificationListenerService;
           import android.service.notification.StatusBarNotification;
 
           public class BankNotificationService extends NotificationListenerService {
               private static final String CH = "mm_bridge";
-              private long last = 0L;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private ContentObserver observer;
+              private long lastImageId = -1L;
 
-              @Override
-              public void onCreate() {
-                  super.onCreate();
-                  NotificationChannel ch = new NotificationChannel(CH, "MM AutoBridge", NotificationManager.IMPORTANCE_HIGH);
-                  getSystemService(NotificationManager.class).createNotificationChannel(ch);
+              static void notifyDetected(Context ctx, String bank, String amount) {
+                  long now = System.currentTimeMillis();
+                  NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                  if (nm == null) return;
+                  nm.createNotificationChannel(
+                      new NotificationChannel(CH, "MM AutoBridge", NotificationManager.IMPORTANCE_HIGH));
+
+                  Intent i = new Intent(ctx, QuickBridgeActivity.class);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                  i.putExtra("amount", amount);
+                  PendingIntent pi = PendingIntent.getActivity(ctx, (int) (now % 100000), i,
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                  Notification n = new Notification.Builder(ctx, CH)
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle(bank + " จ่าย " + amount + " บาท")
+                      .setContentText("แตะเพื่อคัดลอกยอดและเปิด Money Manager")
+                      .setAutoCancel(true)
+                      .setContentIntent(pi)
+                      .build();
+                  nm.notify((int) (now % 100000), n);
               }
 
               @Override
               public void onListenerConnected() {
                   Store.debug(this, "SYSTEM: บริการอ่านแจ้งเตือนเชื่อมต่อแล้ว");
+                  startImageWatch();
               }
 
+              @Override
+              public void onListenerDisconnected() {
+                  stopImageWatch();
+              }
+
+              @Override
+              public void onDestroy() {
+                  stopImageWatch();
+                  super.onDestroy();
+              }
+
+              // ---------- bank notifications ----------
               @Override
               public void onNotificationPosted(StatusBarNotification sbn) {
                   if (sbn == null) return;
                   String pkg = sbn.getPackageName();
                   if (pkg == null || pkg.equals(getPackageName())) return;
+
+                  // Non-bank apps: log package name only (no content, for privacy)
+                  if (!BankParser.isBank(pkg)) {
+                      Store.debug(this, "- " + pkg);
+                      return;
+                  }
 
                   Bundle ex = sbn.getNotification().extras;
                   if (ex == null) return;
@@ -269,31 +410,74 @@ jobs:
                   String text = b == null ? "" : b.toString();
 
                   String[] r = BankParser.parse(pkg, title, text);
-                  String mark = r != null ? "OK จับได้ " + r[1]
-                              : (BankParser.isBank(pkg) ? "X ธนาคาร แต่อ่านยอดไม่ได้" : "- ไม่ใช่แอปธนาคาร");
-                  Store.debug(this, mark + " | " + pkg + " | " + title + " | " + text);
+                  Store.debug(this, (r != null ? "OK จับได้ " + r[1] : "X ธนาคาร แต่อ่านยอดไม่ได้")
+                      + " | " + pkg + " | " + title + " | " + text);
                   if (r == null) return;
 
-                  long now = System.currentTimeMillis();
-                  if (now - last < 3000) return;
-                  last = now;
+                  if (Store.addIfNew(this, r[0], r[1], r[2])) {
+                      notifyDetected(this, r[0], r[1]);
+                  }
+              }
 
-                  Store.add(this, r[0], r[1], r[2]);
+              // ---------- slip images ----------
+              private void startImageWatch() {
+                  if (observer != null) return;
+                  observer = new ContentObserver(handler) {
+                      @Override
+                      public void onChange(boolean selfChange, Uri uri) {
+                          checkNewImage();
+                      }
+                  };
+                  getContentResolver().registerContentObserver(
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer);
+              }
 
-                  Intent i = new Intent(this, QuickBridgeActivity.class);
-                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-                  i.putExtra("amount", r[1]);
-                  PendingIntent pi = PendingIntent.getActivity(this, (int) (now % 100000), i,
-                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              private void stopImageWatch() {
+                  if (observer != null) {
+                      getContentResolver().unregisterContentObserver(observer);
+                      observer = null;
+                  }
+              }
 
-                  Notification n = new Notification.Builder(this, CH)
-                      .setSmallIcon(android.R.drawable.ic_dialog_info)
-                      .setContentTitle(r[0] + " จ่าย " + r[1] + " บาท")
-                      .setContentText("แตะเพื่อคัดลอกยอดและเปิด Money Manager")
-                      .setAutoCancel(true)
-                      .setContentIntent(pi)
-                      .build();
-                  getSystemService(NotificationManager.class).notify((int) (now % 100000), n);
+              private void checkNewImage() {
+                  String[] proj = {
+                      MediaStore.Images.Media._ID,
+                      MediaStore.Images.Media.RELATIVE_PATH,
+                      MediaStore.Images.Media.DISPLAY_NAME
+                  };
+                  long since = System.currentTimeMillis() / 1000L - 120L;
+                  String sel = MediaStore.Images.Media.DATE_ADDED + " > ?";
+                  String[] args = { String.valueOf(since) };
+                  String order = MediaStore.Images.Media.DATE_ADDED + " DESC";
+
+                  try (Cursor c = getContentResolver().query(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, args, order)) {
+                      if (c == null || !c.moveToFirst()) return;
+                      long id = c.getLong(0);
+                      if (id == lastImageId) return;
+                      lastImageId = id;
+
+                      String path = c.getString(1) == null ? "" : c.getString(1);
+                      String name = c.getString(2) == null ? "" : c.getString(2);
+                      final String bank = BankParser.bankFromPath(path + "/" + name);
+                      Store.debug(this, "IMG " + (bank == null ? "- ไม่ใช่สลิป" : "สลิป " + bank) + " | " + path + name);
+                      if (bank == null) return;
+
+                      final Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                      // wait a moment so the bank app finishes writing the file
+                      handler.postDelayed(() -> Slip.read(this, uri, (amount, err) -> {
+                          if (amount == null) {
+                              Store.debug(this, "X สลิป " + bank + " อ่านยอดไม่ได้: " + err);
+                              return;
+                          }
+                          Store.debug(this, "OK สลิป " + bank + " ยอด " + amount);
+                          if (Store.addIfNew(this, bank, amount, "สลิป " + bank)) {
+                              notifyDetected(this, bank, amount);
+                          }
+                      }), 1500L);
+                  } catch (Exception e) {
+                      Store.debug(this, "IMG error (ยังไม่ได้อนุญาตรูปภาพ?): " + e.getMessage());
+                  }
               }
           }
           EOF
@@ -336,9 +520,12 @@ jobs:
 
           import android.Manifest;
           import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
           import android.content.ComponentName;
           import android.content.ContentValues;
           import android.content.Intent;
+          import android.content.pm.PackageManager;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
@@ -355,6 +542,7 @@ jobs:
           import java.nio.charset.StandardCharsets;
 
           public class MainActivity extends Activity {
+              private static final int PICK_SLIP = 7;
               private TextView status;
               private TextView log;
 
@@ -373,11 +561,13 @@ jobs:
                   addButton(root, "1. เปิดสิทธิ์อ่านการแจ้งเตือน", () ->
                       startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
 
-                  addButton(root, "2. อนุญาตให้แอปแสดงการแจ้งเตือน", () -> {
+                  addButton(root, "2. อนุญาตแจ้งเตือน + อ่านรูปสลิป", () -> {
                       if (Build.VERSION.SDK_INT >= 33) {
-                          requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, 1);
+                          requestPermissions(new String[] {
+                              Manifest.permission.POST_NOTIFICATIONS,
+                              Manifest.permission.READ_MEDIA_IMAGES }, 1);
                       } else {
-                          toast("ไม่ต้องขอสิทธิ์ในเวอร์ชันนี้");
+                          requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE }, 1);
                       }
                   });
 
@@ -385,6 +575,12 @@ jobs:
                       NotificationListenerService.requestRebind(
                           new ComponentName(this, BankNotificationService.class));
                       toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
+                  });
+
+                  addButton(root, "อ่านยอดจากรูปสลิป (เลือกรูป)", () -> {
+                      Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                      i.setType("image/*");
+                      startActivityForResult(i, PICK_SLIP);
                   });
 
                   addButton(root, "ทดสอบ: เพิ่มรายการ 150.00", () -> {
@@ -420,21 +616,46 @@ jobs:
                   refresh();
               }
 
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != PICK_SLIP || res != RESULT_OK || data == null || data.getData() == null) return;
+                  toast("กำลังอ่านสลิป...");
+                  Slip.read(this, data.getData(), (amount, err) -> {
+                      if (amount == null) {
+                          toast(err);
+                          return;
+                      }
+                      Store.add(this, "SLIP", amount, "จากรูปสลิป");
+                      ClipboardManager cb = getSystemService(ClipboardManager.class);
+                      if (cb != null) cb.setPrimaryClip(ClipData.newPlainText("amount", amount));
+                      toast("อ่านได้ " + amount + " บาท (คัดลอกแล้ว)");
+                      refresh();
+                  });
+              }
+
               private boolean listenerEnabled() {
                   String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
                   return flat != null && flat.contains(getPackageName());
               }
 
+              private boolean imagesAllowed() {
+                  String perm = Build.VERSION.SDK_INT >= 33
+                      ? Manifest.permission.READ_MEDIA_IMAGES
+                      : Manifest.permission.READ_EXTERNAL_STORAGE;
+                  return checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED;
+              }
+
               private void refresh() {
-                  status.setText(listenerEnabled()
-                      ? "สถานะ: เปิดสิทธิ์อ่านแจ้งเตือนแล้ว ✅"
-                      : "สถานะ: ยังไม่ได้เปิดสิทธิ์อ่านแจ้งเตือน ❌ (กดปุ่ม 1)");
+                  status.setText(
+                      (listenerEnabled() ? "อ่านแจ้งเตือน: ✅" : "อ่านแจ้งเตือน: ❌ (กดปุ่ม 1)") + "\n"
+                      + (imagesAllowed() ? "อ่านรูปสลิปอัตโนมัติ: ✅" : "อ่านรูปสลิปอัตโนมัติ: ❌ (กดปุ่ม 2)"));
                   String r = Store.rows(this);
                   String d = Store.debugLog(this);
                   log.setText("=== รายการที่บันทึก ===\n"
                       + (r.isEmpty() ? "(ยังไม่มี)" : r)
-                      + "\n\n=== แจ้งเตือนล่าสุดที่แอปเห็น (debug) ===\n"
-                      + (d.isEmpty() ? "(ยังไม่เห็นแจ้งเตือนใดเลย)" : d));
+                      + "\n\n=== debug ===\n"
+                      + (d.isEmpty() ? "(ยังไม่มี)" : d));
               }
 
               private void addButton(LinearLayout root, String text, Runnable action) {
@@ -477,7 +698,7 @@ jobs:
         if: failure()
         run: |
           echo "=========== ERRORS ==========="
-          grep -n -i -E "error:|what went wrong|cannot find symbol" -A 3 /tmp/build.log | head -n 60 || true
+          grep -n -i -E "error:|what went wrong|cannot find symbol|cannot access|duplicate class" -A 3 /tmp/build.log | head -n 60 || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
