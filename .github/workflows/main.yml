@@ -1,4 +1,4 @@
-name: Build MM AutoBridge APK (Clean v10)
+name: Build MM AutoBridge APK (v11 debug)
 
 on:
   push:
@@ -62,8 +62,8 @@ jobs:
                   applicationId = "com.example.mmbridge"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 10
-                  versionName = "10.0"
+                  versionCode = 11
+                  versionName = "11.0-debug"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -121,22 +121,42 @@ jobs:
           public class Store {
               private static final String PREF = "mm_bridge";
               private static final String KEY = "rows";
+              private static final String DBG = "debug";
+
+              private static SharedPreferences p(Context ctx) {
+                  return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+              }
+
+              private static String clean(String s) {
+                  return s == null ? "" : s.replace("\t", " ").replace("\n", " ");
+              }
 
               public static void add(Context ctx, String bank, String amount, String note) {
                   String date = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date());
-                  String safeNote = note.replace("\t", " ").replace("\n", " ");
-                  String row = date + "\t" + bank + "\tอื่นๆ\t\t" + safeNote + "\t" + amount + "\tExpense\t";
-                  SharedPreferences p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE);
-                  String old = p.getString(KEY, "");
-                  p.edit().putString(KEY, old.isEmpty() ? row : old + "\n" + row).apply();
+                  String row = date + "\t" + bank + "\tอื่นๆ\t\t" + clean(note) + "\t" + amount + "\tExpense\t";
+                  String old = p(ctx).getString(KEY, "");
+                  p(ctx).edit().putString(KEY, old.isEmpty() ? row : old + "\n" + row).commit();
               }
 
-              public static String rows(Context ctx) {
-                  return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY, "");
+              public static void debug(Context ctx, String line) {
+                  String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                  String entry = "[" + time + "] " + clean(line);
+                  String old = p(ctx).getString(DBG, "");
+                  String all = old.isEmpty() ? entry : entry + "\n" + old;
+                  String[] lines = all.split("\n");
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < lines.length && i < 30; i++) {
+                      if (i > 0) sb.append("\n");
+                      sb.append(lines[i]);
+                  }
+                  p(ctx).edit().putString(DBG, sb.toString()).commit();
               }
+
+              public static String rows(Context ctx) { return p(ctx).getString(KEY, ""); }
+              public static String debugLog(Context ctx) { return p(ctx).getString(DBG, ""); }
 
               public static void clear(Context ctx) {
-                  ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().remove(KEY).apply();
+                  p(ctx).edit().remove(KEY).remove(DBG).commit();
               }
 
               public static String tsv(Context ctx) {
@@ -151,6 +171,7 @@ jobs:
           package com.example.mmbridge;
 
           import java.util.HashMap;
+          import java.util.Locale;
           import java.util.Map;
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
@@ -166,25 +187,41 @@ jobs:
                   BANKS.put("th.co.truemoney.wallet", "TrueMoney");
               }
 
-              private static final String[] IGNORE = { "เงินเข้า", "รับเงิน", "OTP", "รหัสยืนยัน" };
+              private static final String[] IGNORE = { "เงินเข้า", "OTP" };
 
-              private static final Pattern AMOUNT = Pattern.compile(
-                  "([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)\\s*(?:บาท|บ\\.|THB)",
-                  Pattern.CASE_INSENSITIVE);
+              private static final String NUM = "([0-9][0-9,]*(?:\\.[0-9]{1,2})?)";
+              private static final Pattern AFTER = Pattern.compile(
+                  "-?" + NUM + "\\s*(?:บาท|บ\\.|THB|฿)", Pattern.CASE_INSENSITIVE);
+              private static final Pattern BEFORE = Pattern.compile(
+                  "(?:THB|฿|จำนวนเงิน|จำนวน|ยอดเงิน|ยอด)\\s*:?\\s*-?" + NUM, Pattern.CASE_INSENSITIVE);
+
+              public static boolean isBank(String pkg) { return BANKS.containsKey(pkg); }
 
               /** returns {bank, amount, note} or null */
               public static String[] parse(String pkg, String title, String text) {
                   String bank = BANKS.get(pkg);
                   if (bank == null) return null;
                   String msg = title + " " + text;
+                  String up = msg.toUpperCase(Locale.ROOT);
                   for (String w : IGNORE) {
-                      if (msg.toUpperCase(java.util.Locale.ROOT).contains(w.toUpperCase(java.util.Locale.ROOT))) return null;
+                      if (up.contains(w.toUpperCase(Locale.ROOT))) return null;
                   }
-                  Matcher m = AMOUNT.matcher(msg);
-                  if (!m.find()) return null;
-                  String amount = m.group(1).replace(",", "");
+                  String amount = find(AFTER, msg);
+                  if (amount == null) amount = find(BEFORE, msg);
+                  if (amount == null) return null;
                   String note = text.length() > 40 ? text.substring(0, 40) : text;
                   return new String[] { bank, amount, note };
+              }
+
+              private static String find(Pattern p, String s) {
+                  Matcher m = p.matcher(s);
+                  while (m.find()) {
+                      String a = m.group(1).replace(",", "");
+                      try {
+                          if (Double.parseDouble(a) > 0) return a;
+                      } catch (NumberFormatException ignored) { }
+                  }
+                  return null;
               }
           }
           EOF
@@ -213,18 +250,28 @@ jobs:
               }
 
               @Override
+              public void onListenerConnected() {
+                  Store.debug(this, "SYSTEM: บริการอ่านแจ้งเตือนเชื่อมต่อแล้ว");
+              }
+
+              @Override
               public void onNotificationPosted(StatusBarNotification sbn) {
                   if (sbn == null) return;
                   String pkg = sbn.getPackageName();
-                  if (pkg == null || !BankParser.BANKS.containsKey(pkg)) return;
+                  if (pkg == null || pkg.equals(getPackageName())) return;
 
                   Bundle ex = sbn.getNotification().extras;
                   if (ex == null) return;
                   CharSequence t = ex.getCharSequence(Notification.EXTRA_TITLE);
                   CharSequence b = ex.getCharSequence(Notification.EXTRA_BIG_TEXT);
                   if (b == null) b = ex.getCharSequence(Notification.EXTRA_TEXT);
+                  String title = t == null ? "" : t.toString();
+                  String text = b == null ? "" : b.toString();
 
-                  String[] r = BankParser.parse(pkg, t == null ? "" : t.toString(), b == null ? "" : b.toString());
+                  String[] r = BankParser.parse(pkg, title, text);
+                  String mark = r != null ? "OK จับได้ " + r[1]
+                              : (BankParser.isBank(pkg) ? "X ธนาคาร แต่อ่านยอดไม่ได้" : "- ไม่ใช่แอปธนาคาร");
+                  Store.debug(this, mark + " | " + pkg + " | " + title + " | " + text);
                   if (r == null) return;
 
                   long now = System.currentTimeMillis();
@@ -236,7 +283,6 @@ jobs:
                   Intent i = new Intent(this, QuickBridgeActivity.class);
                   i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
                   i.putExtra("amount", r[1]);
-                  i.putExtra("bank", r[0]);
                   PendingIntent pi = PendingIntent.getActivity(this, (int) (now % 100000), i,
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
@@ -290,6 +336,7 @@ jobs:
 
           import android.Manifest;
           import android.app.Activity;
+          import android.content.ComponentName;
           import android.content.ContentValues;
           import android.content.Intent;
           import android.net.Uri;
@@ -298,6 +345,7 @@ jobs:
           import android.os.Environment;
           import android.provider.MediaStore;
           import android.provider.Settings;
+          import android.service.notification.NotificationListenerService;
           import android.widget.Button;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
@@ -307,6 +355,7 @@ jobs:
           import java.nio.charset.StandardCharsets;
 
           public class MainActivity extends Activity {
+              private TextView status;
               private TextView log;
 
               @Override
@@ -315,6 +364,11 @@ jobs:
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
                   root.setPadding(40, 40, 40, 40);
+
+                  status = new TextView(this);
+                  status.setTextSize(16f);
+                  status.setPadding(0, 0, 0, 20);
+                  root.addView(status);
 
                   addButton(root, "1. เปิดสิทธิ์อ่านการแจ้งเตือน", () ->
                       startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
@@ -327,26 +381,37 @@ jobs:
                       }
                   });
 
-                  addButton(root, "ทดสอบ: คัดลอก 150.00 และเปิด Money Manager", () -> {
+                  addButton(root, "3. เชื่อมต่อบริการใหม่ (ถ้าสถานะไม่ขึ้น)", () -> {
+                      NotificationListenerService.requestRebind(
+                          new ComponentName(this, BankNotificationService.class));
+                      toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
+                  });
+
+                  addButton(root, "ทดสอบ: เพิ่มรายการ 150.00", () -> {
                       Store.add(this, "TEST", "150.00", "ทดสอบ");
+                      refresh();
+                      toast("เพิ่มรายการทดสอบแล้ว");
+                  });
+
+                  addButton(root, "ทดสอบ: คัดลอก 150.00 และเปิด Money Manager", () -> {
                       Intent i = new Intent(this, QuickBridgeActivity.class);
                       i.putExtra("amount", "150.00");
                       startActivity(i);
                   });
 
                   addButton(root, "ส่งออกไฟล์ไปที่ Download", this::export);
-
-                  addButton(root, "ล้างรายการทั้งหมด", () -> {
-                      Store.clear(this);
-                      refresh();
-                  });
+                  addButton(root, "รีเฟรช", this::refresh);
+                  addButton(root, "ล้างทั้งหมด", () -> { Store.clear(this); refresh(); });
 
                   log = new TextView(this);
+                  log.setTextSize(13f);
+                  log.setTextIsSelectable(true);
                   log.setPadding(0, 30, 0, 0);
+                  root.addView(log);
+
                   ScrollView sv = new ScrollView(this);
-                  sv.addView(log);
-                  root.addView(sv);
-                  setContentView(root);
+                  sv.addView(root);
+                  setContentView(sv);
               }
 
               @Override
@@ -355,9 +420,21 @@ jobs:
                   refresh();
               }
 
+              private boolean listenerEnabled() {
+                  String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+                  return flat != null && flat.contains(getPackageName());
+              }
+
               private void refresh() {
+                  status.setText(listenerEnabled()
+                      ? "สถานะ: เปิดสิทธิ์อ่านแจ้งเตือนแล้ว ✅"
+                      : "สถานะ: ยังไม่ได้เปิดสิทธิ์อ่านแจ้งเตือน ❌ (กดปุ่ม 1)");
                   String r = Store.rows(this);
-                  log.setText(r.isEmpty() ? "ยังไม่มีรายการ" : "รายการที่บันทึกไว้:\n" + r);
+                  String d = Store.debugLog(this);
+                  log.setText("=== รายการที่บันทึก ===\n"
+                      + (r.isEmpty() ? "(ยังไม่มี)" : r)
+                      + "\n\n=== แจ้งเตือนล่าสุดที่แอปเห็น (debug) ===\n"
+                      + (d.isEmpty() ? "(ยังไม่เห็นแจ้งเตือนใดเลย)" : d));
               }
 
               private void addButton(LinearLayout root, String text, Runnable action) {
@@ -378,10 +455,7 @@ jobs:
                       cv.put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.ms-excel");
                       cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
                       Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
-                      if (uri == null) {
-                          toast("สร้างไฟล์ไม่ได้");
-                          return;
-                      }
+                      if (uri == null) { toast("สร้างไฟล์ไม่ได้"); return; }
                       try (OutputStream os = getContentResolver().openOutputStream(uri)) {
                           os.write(Store.tsv(this).getBytes(StandardCharsets.UTF_8));
                       }
@@ -403,7 +477,7 @@ jobs:
         if: failure()
         run: |
           echo "=========== ERRORS ==========="
-          grep -n -i -E "error:|error |what went wrong|unresolved|cannot find symbol" -A 3 /tmp/build.log | head -n 60 || true
+          grep -n -i -E "error:|what went wrong|cannot find symbol" -A 3 /tmp/build.log | head -n 60 || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
