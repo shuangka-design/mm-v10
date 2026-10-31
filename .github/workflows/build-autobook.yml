@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.8 fixed signing key)
+name: Build AutoBook APK (v3.9 delete accounts + export MM)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 11
-                  versionName = "3.8"
+                  versionCode = 12
+                  versionName = "3.9"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -337,6 +337,49 @@ jobs:
                   return names("SELECT name FROM acc ORDER BY ord", null);
               }
 
+              public synchronized int countAccount(String name) {
+                  try (Cursor c = getReadableDatabase().rawQuery(
+                          "SELECT COUNT(*) FROM tx WHERE account = ? OR to_account = ?", new String[] { name, name })) {
+                      return c.moveToFirst() ? c.getInt(0) : 0;
+                  }
+              }
+
+              /** moveTo == null -> delete the account's transactions too */
+              public synchronized void deleteAccount(String name, String moveTo) {
+                  SQLiteDatabase d = getWritableDatabase();
+                  d.beginTransaction();
+                  try {
+                      if (moveTo == null) {
+                          d.delete("tx", "account = ? OR to_account = ?", new String[] { name, name });
+                      } else {
+                          d.execSQL("UPDATE tx SET account = ? WHERE account = ?", new Object[] { moveTo, name });
+                          d.execSQL("UPDATE tx SET to_account = ? WHERE to_account = ?", new Object[] { moveTo, name });
+                          // transfer to itself is meaningless -> drop it
+                          d.delete("tx", "type = 2 AND account = to_account", null);
+                      }
+                      d.delete("acc", "name = ?", new String[] { name });
+                      d.setTransactionSuccessful();
+                  } finally {
+                      d.endTransaction();
+                  }
+              }
+
+              public synchronized void renameAccount(String from, String to) {
+                  SQLiteDatabase d = getWritableDatabase();
+                  d.beginTransaction();
+                  try {
+                      d.execSQL("UPDATE tx SET account = ? WHERE account = ?", new Object[] { to, from });
+                      d.execSQL("UPDATE tx SET to_account = ? WHERE to_account = ?", new Object[] { to, from });
+                      boolean exists;
+                      try (Cursor c = d.rawQuery("SELECT 1 FROM acc WHERE name = ?", new String[] { to })) { exists = c.moveToFirst(); }
+                      if (exists) d.delete("acc", "name = ?", new String[] { from });
+                      else d.execSQL("UPDATE acc SET name = ? WHERE name = ?", new Object[] { to, from });
+                      d.setTransactionSuccessful();
+                  } finally {
+                      d.endTransaction();
+                  }
+              }
+
               public synchronized void addCategory(String name, int type) {
                   if (name == null || name.trim().isEmpty()) return;
                   SQLiteDatabase d = getWritableDatabase();
@@ -531,6 +574,24 @@ jobs:
                       if (acc != null) return acc;
                   }
                   return null;
+              }
+
+              /** repl == null -> forget; otherwise point bank / digit settings at repl */
+              public static void replaceAccount(Context c, String old, String repl) {
+                  SharedPreferences.Editor e = p(c).edit();
+                  for (java.util.Map.Entry<String, ?> en : p(c).getAll().entrySet()) {
+                      if (en.getKey().startsWith("acc_") && old.equals(en.getValue())) {
+                          if (repl == null) e.remove(en.getKey()); else e.putString(en.getKey(), repl);
+                      }
+                  }
+                  e.apply();
+                  java.util.LinkedHashMap<String, String> m = digitMap(c);
+                  java.util.Iterator<java.util.Map.Entry<String, String>> it = m.entrySet().iterator();
+                  while (it.hasNext()) {
+                      java.util.Map.Entry<String, String> en = it.next();
+                      if (old.equals(en.getValue())) { if (repl == null) it.remove(); else en.setValue(repl); }
+                  }
+                  saveDigitMap(c, m);
               }
 
               public static void setAccount(Context c, String bank, String acc) {
@@ -1225,6 +1286,241 @@ jobs:
               }
           }
           EOF
+          cat > $J/Exporter.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.database.sqlite.SQLiteDatabase;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.math.BigDecimal;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /**
+           * Writes AutoBook data into a copy of a real Money Manager .mmbak.
+           * Every new row is cloned from an existing row of the same kind, so all the
+           * columns Money Manager needs keep valid values; only the known fields change.
+           */
+          public class Exporter {
+              private SQLiteDatabase d;
+              private final Map<String, Long> nextId = new HashMap<>();
+              private final Map<String, String> assetUid = new HashMap<>();
+              private final Map<String, String> catUid = new HashMap<>();
+              private ContentValues assetTpl, catTplEx, catTplIn;
+              private Object catTypeEx, catTypeIn;
+              private ContentValues tEx, tIn, t3, t4, t7, t8;
+              private boolean pairSwap;
+
+              public static String run(Context c, File template, File out) throws Exception {
+                  try (InputStream in = new FileInputStream(template); OutputStream os = new FileOutputStream(out)) {
+                      Photos.copy(in, os);
+                  }
+                  return new Exporter().go(c, out);
+              }
+
+              private static String uid() { return UUID.randomUUID().toString(); }
+
+              private static String s(Object o) { return o == null ? "" : String.valueOf(o); }
+
+              private ContentValues row(String sql, String... a) {
+                  try (Cursor c = d.rawQuery(sql, a)) {
+                      if (!c.moveToFirst()) return null;
+                      ContentValues v = new ContentValues();
+                      for (int i = 0; i < c.getColumnCount(); i++) {
+                          String n = c.getColumnName(i);
+                          switch (c.getType(i)) {
+                              case Cursor.FIELD_TYPE_INTEGER: v.put(n, c.getLong(i)); break;
+                              case Cursor.FIELD_TYPE_FLOAT: v.put(n, c.getDouble(i)); break;
+                              case Cursor.FIELD_TYPE_STRING: v.put(n, c.getString(i)); break;
+                              case Cursor.FIELD_TYPE_BLOB: v.put(n, c.getBlob(i)); break;
+                              default: v.putNull(n);
+                          }
+                      }
+                      return v;
+                  }
+              }
+
+              /** set a column, keeping the template's storage kind (text vs number) */
+              private static void set(ContentValues v, String col, Object val) {
+                  if (!v.containsKey(col)) return;
+                  Object old = v.get(col);
+                  if (val == null) { v.putNull(col); return; }
+                  if (old instanceof String) {
+                      if (val instanceof Double) v.put(col, BigDecimal.valueOf((Double) val).stripTrailingZeros().toPlainString());
+                      else v.put(col, String.valueOf(val));
+                  } else if (val instanceof Double) v.put(col, (Double) val);
+                  else if (val instanceof Long) v.put(col, (Long) val);
+                  else if (val instanceof Integer) v.put(col, (long) (Integer) val);
+                  else v.put(col, String.valueOf(val));
+              }
+
+              private static boolean sameNum(Object a, Object b) {
+                  try { return Math.abs(Double.parseDouble(s(a)) - Double.parseDouble(s(b))) < 0.0001; }
+                  catch (Exception e) { return false; }
+              }
+
+              private void insert(String table, ContentValues v) {
+                  if (v.containsKey("ID")) {
+                      Long n = nextId.get(table);
+                      if (n == null) {
+                          try (Cursor c = d.rawQuery("SELECT IFNULL(MAX(CAST(ID AS INTEGER)), 0) FROM " + table, null)) {
+                              n = c.moveToFirst() ? c.getLong(0) + 1 : 1;
+                          }
+                      }
+                      set(v, "ID", n);
+                      nextId.put(table, n + 1);
+                  }
+                  if (d.insert(table, null, v) == -1) throw new RuntimeException("เขียน " + table + " ไม่ได้");
+              }
+
+              private ContentValues tx(int doType) {
+                  return row("SELECT * FROM INOUTCOME WHERE CAST(DO_TYPE AS INTEGER) = ? LIMIT 1", String.valueOf(doType));
+              }
+
+              private String asset(String name) {
+                  if (name == null || name.isEmpty()) name = "ไม่ระบุบัญชี";
+                  String u = assetUid.get(name);
+                  if (u != null) return u;
+                  ContentValues v = new ContentValues(assetTpl);
+                  u = uid();
+                  set(v, "uid", u);
+                  set(v, "NIC_NAME", name);
+                  for (String k : new String[] { "C_IS_DEL", "IS_DEL" }) set(v, k, 0);
+                  insert("ASSETS", v);
+                  assetUid.put(name, u);
+                  return u;
+              }
+
+              private String category(String name, boolean expense) {
+                  if (name == null || name.isEmpty()) name = "อื่นๆ";
+                  String key = (expense ? "1|" : "0|") + name;
+                  String u = catUid.get(key);
+                  if (u != null) return u;
+                  ContentValues tpl = expense ? catTplEx : catTplIn;
+                  if (tpl == null) return "";
+                  ContentValues v = new ContentValues(tpl);
+                  u = uid();
+                  set(v, "uid", u);
+                  set(v, "NAME", name);
+                  for (String k : new String[] { "C_IS_DEL", "IS_DEL" }) set(v, k, 0);
+                  set(v, "ORDERSEQ", catUid.size() + 100);
+                  insert("ZCATEGORY", v);
+                  catUid.put(key, u);
+                  return u;
+              }
+
+              /** clone a transaction template, update every amount/date column that mirrors the template */
+              private ContentValues fill(ContentValues tpl, int doType, long ts, double amount, String note) {
+                  ContentValues v = new ContentValues(tpl);
+                  Object money = tpl.get("ZMONEY"), date = tpl.get("ZDATE");
+                  for (String k : tpl.keySet()) {
+                      String K = k.toUpperCase(Locale.ROOT);
+                      if ((K.contains("MONEY") || K.contains("AMOUNT")) && sameNum(tpl.get(k), money)) set(v, k, amount);
+                      if (K.contains("DATE") && s(tpl.get(k)).equals(s(date))) set(v, k, ts);
+                  }
+                  set(v, "ZMONEY", amount);
+                  set(v, "ZDATE", ts);
+                  set(v, "DO_TYPE", doType);
+                  set(v, "ZCONTENT", note == null ? "" : note);
+                  set(v, "uid", uid());
+                  set(v, "IS_DEL", 0);
+                  return v;
+              }
+
+              private String go(Context c, File out) {
+                  d = SQLiteDatabase.openDatabase(out.getPath(), null, SQLiteDatabase.OPEN_READWRITE);
+                  try {
+                      for (String t : new String[] { "INOUTCOME", "ASSETS", "ZCATEGORY" }) {
+                          try (Cursor k = d.rawQuery("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", new String[] { t })) {
+                              if (!k.moveToFirst()) throw new RuntimeException("ไฟล์นี้ไม่ใช่ backup ของ Money Manager");
+                          }
+                      }
+                      tEx = tx(1); tIn = tx(0); t3 = tx(3); t7 = tx(7); t8 = tx(8);
+                      if (tEx == null) tEx = tIn;
+                      if (tIn == null) tIn = tEx;
+                      if (tEx == null) throw new RuntimeException("ใน Money Manager ต้องมีรายจ่ายหรือรายรับอย่างน้อย 1 รายการ");
+                      if (t3 != null) {
+                          t4 = row("SELECT * FROM INOUTCOME WHERE CAST(DO_TYPE AS INTEGER) = 4 AND ZDATE = ? LIMIT 1", s(t3.get("ZDATE")));
+                          pairSwap = t4 != null && s(t4.get("assetUid")).equals(s(t3.get("toAssetUid")));
+                      }
+                      assetTpl = row("SELECT * FROM ASSETS LIMIT 1");
+                      if (assetTpl == null) throw new RuntimeException("ใน Money Manager ต้องมีบัญชีอย่างน้อย 1 บัญชี");
+                      try (Cursor k = d.rawQuery("SELECT uid, NIC_NAME FROM ASSETS", null)) {
+                          while (k.moveToNext()) if (!assetUid.containsKey(s(k.getString(1)).trim())) assetUid.put(s(k.getString(1)).trim(), k.getString(0));
+                      }
+                      ContentValues ge = row("SELECT g.* FROM INOUTCOME i JOIN ZCATEGORY g ON g.uid = i.ctgUid WHERE CAST(i.DO_TYPE AS INTEGER) = 1 LIMIT 1");
+                      ContentValues gi = row("SELECT g.* FROM INOUTCOME i JOIN ZCATEGORY g ON g.uid = i.ctgUid WHERE CAST(i.DO_TYPE AS INTEGER) = 0 LIMIT 1");
+                      catTplEx = ge != null ? ge : gi;
+                      catTplIn = gi != null ? gi : ge;
+                      catTypeEx = ge == null ? null : ge.get("TYPE");
+                      catTypeIn = gi == null ? null : gi.get("TYPE");
+                      try (Cursor k = d.rawQuery("SELECT uid, NAME, TYPE FROM ZCATEGORY", null)) {
+                          while (k.moveToNext()) {
+                              String n = s(k.getString(1)).trim(), t = s(k.getString(2));
+                              if (catTypeEx != null && t.equals(s(catTypeEx))) catUid.putIfAbsent("1|" + n, k.getString(0));
+                              if (catTypeIn != null && t.equals(s(catTypeIn))) catUid.putIfAbsent("0|" + n, k.getString(0));
+                          }
+                      }
+
+                      List<Db.Tx> all = Db.get(c).query(null, null, "ts");
+                      int n = 0;
+                      d.beginTransaction();
+                      try {
+                          d.delete("INOUTCOME", null, null);
+                          for (Db.Tx t : all) {
+                              if (t.amount == 0) continue;
+                              String from = asset(t.account);
+                              if (t.type == 0 || t.type == 1) {
+                                  boolean ex = t.type == 0;
+                                  ContentValues v = fill(ex ? tEx : tIn, ex ? 1 : 0, t.ts, t.amount, t.note);
+                                  set(v, "assetUid", from);
+                                  set(v, "ctgUid", category(t.category, ex));
+                                  set(v, "toAssetUid", "");
+                                  insert("INOUTCOME", v);
+                              } else if (t.type == 2) {
+                                  String to = asset(t.toAccount);
+                                  ContentValues v = fill(t3 != null ? t3 : tEx, 3, t.ts, t.amount, t.note);
+                                  set(v, "assetUid", from);
+                                  set(v, "toAssetUid", to);
+                                  if (t3 == null) set(v, "ctgUid", "");
+                                  insert("INOUTCOME", v);
+                                  if (t4 != null) {
+                                      ContentValues w = fill(t4, 4, t.ts, t.amount, t.note);
+                                      set(w, "assetUid", pairSwap ? to : from);
+                                      set(w, "toAssetUid", pairSwap ? from : to);
+                                      insert("INOUTCOME", w);
+                                  }
+                              } else if (t.type == 3) {
+                                  boolean plus = t.amount > 0;
+                                  ContentValues tpl = plus ? (t7 != null ? t7 : tIn) : (t8 != null ? t8 : tEx);
+                                  ContentValues v = fill(tpl, plus ? 7 : 8, t.ts, Math.abs(t.amount), t.note);
+                                  set(v, "assetUid", from);
+                                  set(v, "toAssetUid", "");
+                                  if (plus ? t7 == null : t8 == null) set(v, "ctgUid", "");
+                                  insert("INOUTCOME", v);
+                              }
+                              n++;
+                          }
+                          d.setTransactionSuccessful();
+                      } finally {
+                          d.endTransaction();
+                      }
+                      return "ส่งออก " + n + " รายการ";
+                  } finally {
+                      d.close();
+                  }
+              }
+          }
+          EOF
 
           cat > $J/Ui.java << 'EOF'
           package com.example.autobook;
@@ -1677,7 +1973,7 @@ jobs:
           import java.util.zip.ZipOutputStream;
 
           public class MainActivity extends Activity {
-              private static final int REQ_IMPORT = 11, REQ_RESTORE = 12;
+              private static final int REQ_IMPORT = 11, REQ_RESTORE = 12, REQ_EXPORT_MM = 13;
               private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT, MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
               private static final Locale TH = new Locale("th", "TH");
               private static final int[] PALETTE = {
@@ -2208,10 +2504,11 @@ jobs:
                       final String an = e.getKey();
                       final double cur = e.getValue();
                       r.setOnClickListener(v -> adjustBalance(an, cur));
+                      r.setOnLongClickListener(v -> { accountMenu(an); return true; });
                       lc.addView(r);
                       if (++i < bal.size()) lc.addView(Ui.line(this));
                   }
-                  note("แตะบัญชีเพื่อใส่ยอดจริงจากธนาคาร แอปจะปรับยอดให้ตรง (ไม่นับเป็นรายรับ/รายจ่าย)");
+                  note("แตะบัญชีเพื่อใส่ยอดจริงจากธนาคาร แอปจะปรับยอดให้ตรง (ไม่นับเป็นรายรับ/รายจ่าย)\nกดค้างที่บัญชีเพื่อเปลี่ยนชื่อหรือลบ");
               }
 
               private void adjustBalance(String acc, double cur) {
@@ -2352,6 +2649,19 @@ jobs:
                       i.setType("*/*");
                       startActivityForResult(i, REQ_IMPORT);
                   }));
+                  d2.addView(btn("📤 ส่งออกไป Money Manager (.mmbak)", v -> new AlertDialog.Builder(this)
+                      .setTitle("ส่งออกไป Money Manager")
+                      .setMessage("เลือกไฟล์ backup ล่าสุดของ Money Manager (.mmbak) เป็นต้นแบบ\n\n"
+                          + "แอปจะสร้างไฟล์ใหม่ที่มีรายการทั้งหมดจาก AutoBook (แทนรายการเดิมในไฟล์นั้น) "
+                          + "แล้วบันทึกที่ Download/AutoBook ไฟล์ต้นแบบไม่ถูกแก้")
+                      .setPositiveButton("เลือกไฟล์", (dd, w) -> {
+                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          startActivityForResult(i, REQ_EXPORT_MM);
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show()));
                   d2.addView(btn("ทดสอบ: เพิ่มรายจ่าย 150.00 (กรุงไทย)", v -> {
                       Db.Tx t = new Db.Tx();
                       t.ts = System.currentTimeMillis(); t.amount = 150; t.account = "กรุงไทย";
@@ -2452,6 +2762,116 @@ jobs:
                   Uri u = data.getData();
                   if (req == REQ_IMPORT) importMm(u);
                   else if (req == REQ_RESTORE) restore(u);
+                  else if (req == REQ_EXPORT_MM) exportMm(u);
+              }
+
+              private void exportMm(Uri u) {
+                  toast("กำลังสร้างไฟล์ Money Manager...");
+                  bg.execute(() -> {
+                      String msg;
+                      File tpl = new File(getCacheDir(), "mm_template.mmbak");
+                      File out = new File(getCacheDir(), "mm_out.mmbak");
+                      try {
+                          try (InputStream in = getContentResolver().openInputStream(u);
+                               OutputStream os = new FileOutputStream(tpl)) {
+                              if (in == null) throw new IOException("เปิดไฟล์ไม่ได้");
+                              Photos.copy(in, os);
+                          }
+                          String r = Exporter.run(this, tpl, out);
+                          String name = "AutoBook-MM-" + new SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(new Date()) + ".mmbak";
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                          v.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream");
+                          v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AutoBook");
+                          Uri dst = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                          if (dst == null) throw new IOException("สร้างไฟล์ไม่ได้");
+                          try (InputStream in = new FileInputStream(out);
+                               OutputStream os = getContentResolver().openOutputStream(dst)) {
+                              Photos.copy(in, os);
+                          }
+                          msg = r + " → Download/AutoBook/" + name;
+                      } catch (Exception e) {
+                          msg = "ส่งออกไม่สำเร็จ: " + e.getMessage();
+                      } finally {
+                          tpl.delete(); out.delete();
+                      }
+                      final String m = msg;
+                      Util.debug(this, "EXPORT MM: " + m);
+                      runOnUiThread(() -> new AlertDialog.Builder(this).setMessage(m).setPositiveButton("ตกลง", null).show());
+                  });
+              }
+
+              // ---------- account delete / rename ----------
+              private void accountMenu(String acc) {
+                  new AlertDialog.Builder(this)
+                      .setTitle(acc)
+                      .setItems(new String[] { "ปรับยอดให้ตรงกับธนาคาร", "เปลี่ยนชื่อบัญชี", "🗑 ลบบัญชี" }, (d, w) -> {
+                          if (w == 0) toast("แตะที่บัญชี (ไม่ต้องกดค้าง) เพื่อปรับยอด");
+                          else if (w == 1) renameAccount(acc);
+                          else if (w == 2) deleteAccount(acc);
+                      })
+                      .show();
+              }
+
+              private void renameAccount(String acc) {
+                  android.widget.EditText e = new android.widget.EditText(this);
+                  e.setText(acc);
+                  new AlertDialog.Builder(this)
+                      .setTitle("เปลี่ยนชื่อบัญชี")
+                      .setView(e)
+                      .setPositiveButton("บันทึก", (d, w) -> {
+                          String n = e.getText().toString().trim();
+                          if (n.isEmpty() || n.equals(acc)) return;
+                          Db.get(this).renameAccount(acc, n);
+                          Util.replaceAccount(this, acc, n);
+                          toast("เปลี่ยนเป็น " + n + " แล้ว");
+                          render();
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show();
+              }
+
+              private void deleteAccount(String acc) {
+                  Db db = Db.get(this);
+                  int n = db.countAccount(acc);
+                  if (n == 0) {
+                      new AlertDialog.Builder(this)
+                          .setMessage("ลบบัญชี " + acc + "?")
+                          .setPositiveButton("ลบ", (d, w) -> { db.deleteAccount(acc, null); Util.replaceAccount(this, acc, null); render(); })
+                          .setNegativeButton("ยกเลิก", null)
+                          .show();
+                      return;
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle("ลบบัญชี " + acc)
+                      .setMessage("บัญชีนี้มี " + n + " รายการ จะทำอย่างไรกับรายการเหล่านี้?")
+                      .setPositiveButton("ย้ายไปบัญชีอื่น", (d, w) -> {
+                          final List<String> others = new ArrayList<>(db.accounts());
+                          others.remove(acc);
+                          if (others.isEmpty()) { toast("ไม่มีบัญชีอื่นให้ย้าย"); return; }
+                          new AlertDialog.Builder(this)
+                              .setTitle("ย้าย " + n + " รายการไปที่")
+                              .setItems(others.toArray(new String[0]), (d2, w2) -> {
+                                  String to = others.get(w2);
+                                  db.deleteAccount(acc, to);
+                                  Util.replaceAccount(this, acc, to);
+                                  toast("ย้ายไป " + to + " และลบ " + acc + " แล้ว");
+                                  render();
+                              })
+                              .show();
+                      })
+                      .setNeutralButton("ลบรายการทั้งหมดด้วย", (d, w) -> new AlertDialog.Builder(this)
+                          .setMessage("ลบ " + acc + " และ " + n + " รายการถาวร?\n(ถ้ามีโอนเข้า/ออกบัญชีนี้ จะถูกลบด้วย)")
+                          .setPositiveButton("ลบถาวร", (d2, w2) -> {
+                              db.deleteAccount(acc, null);
+                              Util.replaceAccount(this, acc, null);
+                              toast("ลบแล้ว");
+                              render();
+                          })
+                          .setNegativeButton("ยกเลิก", null)
+                          .show())
+                      .setNegativeButton("ยกเลิก", null)
+                      .show();
               }
 
               private void importMm(Uri u) {
