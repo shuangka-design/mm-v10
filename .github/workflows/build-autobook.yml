@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.9 delete accounts + export MM)
+name: Build AutoBook APK (v3.10 account detail)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 12
-                  versionName = "3.9"
+                  versionCode = 13
+                  versionName = "3.10"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -1984,6 +1984,7 @@ jobs:
               private final ExecutorService bg = Executors.newSingleThreadExecutor();
               private final Calendar month = Calendar.getInstance();
               private int nav = 0, sub = 0, statType = 0;
+              private String accView = null; // account detail screen
               private volatile boolean busy = false;
               private volatile int aiStatus = -2;
               private LinearLayout monthBar, subTabs, totalsRow, content, bottom;
@@ -2159,7 +2160,8 @@ jobs:
               // ---------------- screens ----------------
               private void render() {
                   boolean yearly = nav == 0 && sub == 2;
-                  monthBar.setVisibility(nav <= 1 ? View.VISIBLE : View.GONE);
+                  if (nav != 2) accView = null;
+                  monthBar.setVisibility(nav <= 1 || accView != null ? View.VISIBLE : View.GONE);
                   totalsRow.setVisibility(nav == 0 ? View.VISIBLE : View.GONE);
                   fab.setVisibility(nav <= 2 ? View.VISIBLE : View.GONE);
                   monthLabel.setText(yearly ? String.valueOf(month.get(Calendar.YEAR))
@@ -2185,7 +2187,8 @@ jobs:
                   } else if (nav == 1) {
                       renderStats(list);
                   } else if (nav == 2) {
-                      renderAccounts();
+                      if (accView != null) renderAccountDetail(accView, list);
+                      else renderAccounts();
                   } else {
                       renderSettings();
                   }
@@ -2232,7 +2235,7 @@ jobs:
                       it.addView(ic);
                       TextView lb = text(11, i == nav ? Ui.RED : Ui.GRAY, items[i][1]);
                       it.addView(lb);
-                      it.setOnClickListener(v -> { nav = idx; render(); });
+                      it.setOnClickListener(v -> { nav = idx; accView = null; render(); });
                       bottom.addView(it, new LinearLayout.LayoutParams(0, WRAP, 1f));
                   }
               }
@@ -2503,12 +2506,147 @@ jobs:
                       r.addView(text(15, e.getValue() >= 0 ? Ui.BLUE : Ui.RED, Util.money(e.getValue())));
                       final String an = e.getKey();
                       final double cur = e.getValue();
-                      r.setOnClickListener(v -> adjustBalance(an, cur));
+                      r.setOnClickListener(v -> { accView = an; render(); });
                       r.setOnLongClickListener(v -> { accountMenu(an); return true; });
                       lc.addView(r);
                       if (++i < bal.size()) lc.addView(Ui.line(this));
                   }
-                  note("แตะบัญชีเพื่อใส่ยอดจริงจากธนาคาร แอปจะปรับยอดให้ตรง (ไม่นับเป็นรายรับ/รายจ่าย)\nกดค้างที่บัญชีเพื่อเปลี่ยนชื่อหรือลบ");
+                  note("แตะบัญชีเพื่อดูว่าใช้จ่ายอะไรไปบ้าง\nกดค้างเพื่อเปลี่ยนชื่อหรือลบ");
+              }
+
+              private double balanceOf(String acc) {
+                  double b = 0;
+                  for (Db.Tx t : Db.get(this).query(null, null, null)) {
+                      String a = t.account.isEmpty() ? "ไม่ระบุบัญชี" : t.account;
+                      String to = t.toAccount.isEmpty() ? "ไม่ระบุบัญชี" : t.toAccount;
+                      if (t.type == 2) {
+                          if (a.equals(acc)) b -= t.amount;
+                          if (to.equals(acc)) b += t.amount;
+                      } else if (a.equals(acc)) {
+                          b += t.type == 1 || t.type == 3 ? t.amount : -t.amount;
+                      }
+                  }
+                  return b;
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (accView != null) { accView = null; render(); return; }
+                  super.onBackPressed();
+              }
+
+              /** one account: balance, this month in/out, spending by category, its transactions */
+              private void renderAccountDetail(String acc, List<Db.Tx> monthList) {
+                  final double bal = balanceOf(acc);
+                  List<Db.Tx> list = new ArrayList<>();
+                  double inc = 0, exp = 0, tin = 0, tout = 0;
+                  Map<String, Double> cat = new HashMap<>();
+                  Map<String, List<Db.Tx>> items = new HashMap<>();
+                  for (Db.Tx t : monthList) {
+                      String a = t.account.isEmpty() ? "ไม่ระบุบัญชี" : t.account;
+                      String to = t.toAccount.isEmpty() ? "ไม่ระบุบัญชี" : t.toAccount;
+                      boolean mine = a.equals(acc), into = t.type == 2 && to.equals(acc);
+                      if (!mine && !into) continue;
+                      list.add(t);
+                      if (t.type == 2) { if (mine) tout += t.amount; if (into) tin += t.amount; }
+                      else if (t.type == 1) inc += t.amount;
+                      else if (t.type == 0) {
+                          exp += t.amount;
+                          String c = t.category.isEmpty() ? "ไม่มีหมวด" : t.category;
+                          cat.merge(c, t.amount, Double::sum);
+                          items.computeIfAbsent(c, k -> new ArrayList<>()).add(t);
+                      }
+                  }
+
+                  LinearLayout head = card();
+                  head.setPadding(dp(16), dp(10), dp(16), dp(12));
+                  TextView back = text(14, Ui.BLUE, "‹ บัญชีทั้งหมด");
+                  back.setPadding(0, dp(4), 0, dp(8));
+                  back.setOnClickListener(v -> { accView = null; render(); });
+                  head.addView(back);
+                  TextView nm = text(20, Ui.DARK, acc);
+                  nm.setTypeface(null, Typeface.BOLD);
+                  head.addView(nm);
+                  head.addView(text(14, bal >= 0 ? Ui.BLUE : Ui.RED, "ยอดคงเหลือ " + Util.money(bal) + " บาท"));
+                  LinearLayout bb = new LinearLayout(this);
+                  Button adj = btn("ปรับยอด", v -> adjustBalance(acc, bal));
+                  Button more = btn("เปลี่ยนชื่อ / ลบ", v -> accountMenu(acc));
+                  bb.addView(adj, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  bb.addView(more, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  head.addView(bb);
+
+                  LinearLayout sum = card();
+                  LinearLayout r1 = new LinearLayout(this);
+                  r1.setPadding(0, dp(12), 0, dp(6));
+                  r1.addView(sumCell("รายรับ", inc, Ui.BLUE));
+                  r1.addView(sumCell("รายจ่าย", exp, Ui.RED));
+                  sum.addView(r1);
+                  LinearLayout r2 = new LinearLayout(this);
+                  r2.setPadding(0, dp(6), 0, dp(12));
+                  r2.addView(sumCell("โอนเข้า", tin, Ui.GRAY));
+                  r2.addView(sumCell("โอนออก", tout, Ui.GRAY));
+                  sum.addView(r2);
+
+                  if (list.isEmpty()) { note("\nเดือนนี้บัญชีนี้ยังไม่มีรายการ\nกด ‹ › ด้านบนเพื่อดูเดือนอื่น"); return; }
+
+                  if (exp > 0) {
+                      List<Map.Entry<String, Double>> l = new ArrayList<>(cat.entrySet());
+                      l.sort((x, y) -> Double.compare(y.getValue(), x.getValue()));
+                      LinearLayout cc = card();
+                      TextView h = text(15, Ui.DARK, "ใช้จ่ายกับอะไร");
+                      h.setTypeface(null, Typeface.BOLD);
+                      h.setPadding(dp(16), dp(12), dp(16), dp(4));
+                      cc.addView(h);
+                      LinearLayout bar = new LinearLayout(this);
+                      bar.setBackground(Ui.round(Ui.LINE, dp(6), 0, 0));
+                      bar.setClipToOutline(true);
+                      for (int i = 0; i < l.size(); i++) {
+                          View seg = new View(this);
+                          seg.setBackgroundColor(PALETTE[i % PALETTE.length]);
+                          bar.addView(seg, new LinearLayout.LayoutParams(0, MATCH, (float) (l.get(i).getValue() / exp)));
+                      }
+                      LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(MATCH, dp(12));
+                      bp.setMargins(dp(16), dp(6), dp(16), dp(8));
+                      cc.addView(bar, bp);
+                      for (int i = 0; i < l.size(); i++) {
+                          final String cn = l.get(i).getKey();
+                          double v = l.get(i).getValue();
+                          LinearLayout r = new LinearLayout(this);
+                          r.setGravity(Gravity.CENTER_VERTICAL);
+                          r.setPadding(dp(16), dp(10), dp(16), dp(10));
+                          TextView pct = text(12, Color.WHITE, String.format(Locale.US, "%.0f%%", v * 100 / exp));
+                          pct.setGravity(Gravity.CENTER);
+                          pct.setBackground(Ui.round(PALETTE[i % PALETTE.length], dp(4), 0, 0));
+                          r.addView(pct, new LinearLayout.LayoutParams(dp(44), WRAP));
+                          TextView cname = Ui.one(text(15, Ui.DARK, cn + "  (" + items.get(cn).size() + ")"));
+                          cname.setPadding(dp(10), 0, 0, 0);
+                          r.addView(cname, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                          r.addView(text(15, Ui.RED, Util.money(v)));
+                          r.setOnClickListener(x -> showCategory(cn, items.get(cn)));
+                          cc.addView(r);
+                          cc.addView(Ui.line(this));
+                      }
+                  }
+
+                  LinearLayout tl = card();
+                  TextView h2 = text(15, Ui.DARK, "รายการทั้งหมด (" + list.size() + ")");
+                  h2.setTypeface(null, Typeface.BOLD);
+                  h2.setPadding(dp(16), dp(12), dp(16), dp(4));
+                  tl.addView(h2);
+                  SimpleDateFormat dm = new SimpleDateFormat("d MMM", TH);
+                  SimpleDateFormat hm = new SimpleDateFormat("HH:mm", Locale.US);
+                  String lastDay = "";
+                  for (Db.Tx t : list) {
+                      String day = dm.format(new Date(t.ts));
+                      if (!day.equals(lastDay)) {
+                          TextView dh = text(12, Ui.GRAY, day);
+                          dh.setPadding(dp(14), dp(8), dp(14), dp(2));
+                          dh.setBackgroundColor(Ui.BG);
+                          tl.addView(dh, new LinearLayout.LayoutParams(MATCH, WRAP));
+                          lastDay = day;
+                      }
+                      tl.addView(txRow(t, hm));
+                  }
               }
 
               private void adjustBalance(String acc, double cur) {
