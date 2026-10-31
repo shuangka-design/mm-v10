@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.10 account detail)
+name: Build AutoBook APK (v3.10.1 export fix)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 13
-                  versionName = "3.10"
+                  versionCode = 14
+                  versionName = "3.10.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -1379,7 +1379,20 @@ jobs:
                       set(v, "ID", n);
                       nextId.put(table, n + 1);
                   }
-                  if (d.insert(table, null, v) == -1) throw new RuntimeException("เขียน " + table + " ไม่ได้");
+                  try {
+                      d.insertOrThrow(table, null, v);
+                  } catch (Exception e) {
+                      throw new RuntimeException("เขียน " + table + " ไม่ได้: " + e.getMessage() + "\nคอลัมน์: " + v.keySet()
+                          + "\nโครงตาราง: " + schema(table));
+                  }
+              }
+
+              private String schema(String table) {
+                  StringBuilder sb = new StringBuilder();
+                  try (Cursor c = d.rawQuery("SELECT sql FROM sqlite_master WHERE tbl_name = ? AND sql IS NOT NULL", new String[] { table })) {
+                      while (c.moveToNext()) sb.append(c.getString(0)).append(" | ");
+                  } catch (Exception ignored) { }
+                  return sb.toString();
               }
 
               private ContentValues tx(int doType) {
@@ -1437,7 +1450,9 @@ jobs:
               }
 
               private String go(Context c, File out) {
-                  d = SQLiteDatabase.openDatabase(out.getPath(), null, SQLiteDatabase.OPEN_READWRITE);
+                  if (!out.exists() || out.length() == 0) throw new RuntimeException("คัดลอกไฟล์ต้นแบบไม่สำเร็จ");
+                  d = SQLiteDatabase.openDatabase(out.getPath(), null,
+                      SQLiteDatabase.OPEN_READWRITE | SQLiteDatabase.NO_LOCALIZED_COLLATORS);
                   try {
                       for (String t : new String[] { "INOUTCOME", "ASSETS", "ZCATEGORY" }) {
                           try (Cursor k = d.rawQuery("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", new String[] { t })) {
@@ -2907,8 +2922,11 @@ jobs:
                   toast("กำลังสร้างไฟล์ Money Manager...");
                   bg.execute(() -> {
                       String msg;
-                      File tpl = new File(getCacheDir(), "mm_template.mmbak");
-                      File out = new File(getCacheDir(), "mm_out.mmbak");
+                      File dir = new File(getFilesDir(), "mmexport");
+                      dir.mkdirs();
+                      File tpl = new File(dir, "mm_template.mmbak");
+                      File out = new File(dir, "mm_out.mmbak");
+                      for (String x : new String[] { "", "-journal", "-wal", "-shm" }) new File(out.getPath() + x).delete();
                       try {
                           try (InputStream in = getContentResolver().openInputStream(u);
                                OutputStream os = new FileOutputStream(tpl)) {
@@ -2931,7 +2949,8 @@ jobs:
                       } catch (Exception e) {
                           msg = "ส่งออกไม่สำเร็จ: " + e.getMessage();
                       } finally {
-                          tpl.delete(); out.delete();
+                          tpl.delete();
+                          for (String x : new String[] { "", "-journal", "-wal", "-shm" }) new File(out.getPath() + x).delete();
                       }
                       final String m = msg;
                       Util.debug(this, "EXPORT MM: " + m);
