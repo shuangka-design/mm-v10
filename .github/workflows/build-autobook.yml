@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.6 auto backup)
+name: Build AutoBook APK (v3.6.1 auto backup)
 
 on:
   push:
@@ -64,7 +64,7 @@ jobs:
                   minSdk = 29
                   targetSdk = 34
                   versionCode = 9
-                  versionName = "3.6"
+                  versionName = "3.6.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -2112,17 +2112,17 @@ jobs:
               }
 
               private void renderSettings() {
-                  LinearLayout bk = card();
-                  bk.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  LinearLayout bkCard = card();
+                  bkCard.setPadding(dp(16), dp(12), dp(16), dp(12));
                   TextView bt = text(16, Ui.DARK, "💾 สำรองข้อมูล");
                   bt.setTypeface(null, Typeface.BOLD);
-                  bk.addView(bt);
+                  bkCard.addView(bt);
                   long last = prefs().getLong("last_backup", 0L);
-                  bk.addView(text(13, last == 0 ? Ui.RED : Ui.GRAY, (last == 0 ? "ยังไม่เคยสำรอง ⚠️"
+                  bkCard.addView(text(13, last == 0 ? Ui.RED : Ui.GRAY, (last == 0 ? "ยังไม่เคยสำรอง ⚠️"
                       : "สำรองล่าสุด: " + new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US).format(new Date(last)))
                       + "\nสำรองอัตโนมัติวันละครั้งตอนเปิดแอป เก็บไว้ 7 ไฟล์ล่าสุดที่ Download/AutoBook"));
-                  bk.addView(btn("💾 สำรองข้อมูล + รูป ตอนนี้", v -> backup(false)));
-                  bk.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
+                  bkCard.addView(btn("💾 สำรองข้อมูล + รูป ตอนนี้", v -> backup(false)));
+                  bkCard.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
                       .setMessage("ข้อมูลปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรอง ดำเนินการต่อ?")
                       .setPositiveButton("กู้คืน", (dd, w) -> {
                           Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
