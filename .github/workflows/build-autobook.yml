@@ -1,15 +1,21 @@
-name: Build AutoBook APK (v3.7 simple categories)
+name: Build AutoBook APK (v3.8 fixed signing key)
 
 on:
   push:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed once: save the fixed signing key into this repo
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -63,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 10
-                  versionName = "3.7"
+                  versionCode = 11
+                  versionName = "3.8"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -2559,6 +2565,27 @@ jobs:
               }
           }
           EOF
+
+      - name: Fixed signing key (same key every build -> install as update)
+        run: |
+          set -e
+          mkdir -p ~/.android
+          if [ -f signing/autobook-debug.keystore ]; then
+            echo "ใช้กุญแจเดิมจาก repo"
+          else
+            echo "ยังไม่มีกุญแจ -> สร้างใหม่ครั้งเดียว แล้วเก็บไว้ใน repo"
+            mkdir -p signing
+            keytool -genkeypair -keystore signing/autobook-debug.keystore -storetype JKS \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898315+github-actions[bot]@users.noreply.github.com"
+            git add signing/autobook-debug.keystore
+            git commit -m "Add fixed signing key [skip ci]"
+            git push
+          fi
+          cp signing/autobook-debug.keystore ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android | grep -i "fingerprint" || true
 
       - name: Build APK
         run: |
