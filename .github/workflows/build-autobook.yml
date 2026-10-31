@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3 transfers + balance)
+name: Build AutoBook APK (v3.1 transfers + balance)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "3.0"
+                  versionCode = 4
+                  versionName = "3.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -2123,7 +2123,7 @@ jobs:
                           msg = "นำเข้าไม่สำเร็จ: " + e.getMessage();
                       }
                       final String m = msg;
-                      runOnUiThread(() -> { toast(m); page = 0; render(); });
+                      runOnUiThread(() -> { toast(m); nav = 0; sub = 0; render(); });
                   });
               }
 
