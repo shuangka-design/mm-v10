@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.5 digits for all banks)
+name: Build AutoBook APK (v3.6 auto backup)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 8
-                  versionName = "3.5"
+                  versionCode = 9
+                  versionName = "3.6"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -1636,6 +1636,33 @@ jobs:
                       runOnUiThread(this::render);
                   });
                   processPending();
+                  autoBackup();
+              }
+
+              private void autoBackup() {
+                  long last = prefs().getLong("last_backup", 0L);
+                  if (System.currentTimeMillis() - last < 24L * 3600000L) return;
+                  if (Db.get(this).query(null, null, null).isEmpty()) return;
+                  backup(true);
+              }
+
+              /** keep only the newest 7 auto/manual backups this app created */
+              private void pruneBackups() {
+                  String[] proj = { MediaStore.Downloads._ID };
+                  String sel = MediaStore.Downloads.RELATIVE_PATH + " LIKE ? AND " + MediaStore.Downloads.DISPLAY_NAME + " LIKE ?";
+                  String[] args = { Environment.DIRECTORY_DOWNLOADS + "/AutoBook%", "AutoBook-%.zip" };
+                  try (android.database.Cursor c = getContentResolver().query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                          proj, sel, args, MediaStore.Downloads.DATE_ADDED + " DESC")) {
+                      if (c == null) return;
+                      int n = 0;
+                      while (c.moveToNext()) {
+                          if (++n <= 7) continue;
+                          try {
+                              getContentResolver().delete(android.content.ContentUris.withAppendedId(
+                                  MediaStore.Downloads.EXTERNAL_CONTENT_URI, c.getLong(0)), null, null);
+                          } catch (Exception ignored) { }
+                      }
+                  } catch (Exception ignored) { }
               }
 
               private TextView totalCell(String label, int color) {
@@ -2080,7 +2107,32 @@ jobs:
                       .show();
               }
 
+              private android.content.SharedPreferences prefs() {
+                  return getSharedPreferences("autobook", MODE_PRIVATE);
+              }
+
               private void renderSettings() {
+                  LinearLayout bk = card();
+                  bk.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  TextView bt = text(16, Ui.DARK, "💾 สำรองข้อมูล");
+                  bt.setTypeface(null, Typeface.BOLD);
+                  bk.addView(bt);
+                  long last = prefs().getLong("last_backup", 0L);
+                  bk.addView(text(13, last == 0 ? Ui.RED : Ui.GRAY, (last == 0 ? "ยังไม่เคยสำรอง ⚠️"
+                      : "สำรองล่าสุด: " + new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US).format(new Date(last)))
+                      + "\nสำรองอัตโนมัติวันละครั้งตอนเปิดแอป เก็บไว้ 7 ไฟล์ล่าสุดที่ Download/AutoBook"));
+                  bk.addView(btn("💾 สำรองข้อมูล + รูป ตอนนี้", v -> backup(false)));
+                  bk.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
+                      .setMessage("ข้อมูลปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรอง ดำเนินการต่อ?")
+                      .setPositiveButton("กู้คืน", (dd, w) -> {
+                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          startActivityForResult(i, REQ_RESTORE);
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show()));
+
                   LinearLayout c = card();
                   c.setPadding(dp(16), dp(12), dp(16), dp(12));
                   c.addView(text(15, Ui.DARK, "อ่านแจ้งเตือนธนาคาร: " + (listenerEnabled() ? "✅" : "❌ (กดปุ่ม 1)")
@@ -2167,17 +2219,6 @@ jobs:
                       i.setType("*/*");
                       startActivityForResult(i, REQ_IMPORT);
                   }));
-                  d2.addView(btn("💾 สำรองข้อมูล + รูป (ไปที่ Download/AutoBook)", v -> backup()));
-                  d2.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
-                      .setMessage("ข้อมูลปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรอง ดำเนินการต่อ?")
-                      .setPositiveButton("กู้คืน", (dd, w) -> {
-                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                          i.addCategory(Intent.CATEGORY_OPENABLE);
-                          i.setType("*/*");
-                          startActivityForResult(i, REQ_RESTORE);
-                      })
-                      .setNegativeButton("ยกเลิก", null)
-                      .show()));
                   d2.addView(btn("ทดสอบ: เพิ่มรายจ่าย 150.00 (กรุงไทย)", v -> {
                       Db.Tx t = new Db.Tx();
                       t.ts = System.currentTimeMillis(); t.amount = 150; t.account = "กรุงไทย";
@@ -2308,8 +2349,8 @@ jobs:
                   z.closeEntry();
               }
 
-              private void backup() {
-                  toast("กำลังสำรองข้อมูล...");
+              private void backup(boolean quiet) {
+                  if (!quiet) toast("กำลังสำรองข้อมูล...");
                   bg.execute(() -> {
                       String msg;
                       try {
@@ -2328,12 +2369,18 @@ jobs:
                                   if (ps != null) for (File p : ps) zipFile(z, p, "photos/" + p.getName());
                               }
                           }
+                          prefs().edit().putLong("last_backup", System.currentTimeMillis()).apply();
+                          pruneBackups();
                           msg = "สำรองแล้ว: Download/AutoBook/" + name;
                       } catch (Exception e) {
                           msg = "สำรองไม่สำเร็จ: " + e.getMessage();
                       }
                       final String m = msg;
-                      runOnUiThread(() -> toast(m));
+                      if (quiet) Util.debug(this, "AUTO BACKUP: " + m);
+                      runOnUiThread(() -> {
+                          if (!quiet || m.startsWith("สำรองไม่")) toast(m);
+                          if (nav == 3) render();
+                      });
                   });
               }
 
