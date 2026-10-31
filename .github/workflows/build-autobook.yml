@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.1 transfers + balance)
+name: Build AutoBook APK (v3.5 digits for all banks)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "3.1"
+                  versionCode = 8
+                  versionName = "3.5"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -356,9 +356,64 @@ jobs:
                   if ("KTB".equals(bank)) return "กรุงไทย";
                   if ("KMA".equals(bank)) return "กรุงศรี";
                   if ("GSB".equals(bank)) return "ออมสิน";
-                  if ("BBL".equals(bank)) return "กรุงเทพ";
+                  if ("BBL".equals(bank)) return "AAT";
                   if ("TrueMoney".equals(bank)) return "TrueMoney";
                   return "Cash";
+              }
+
+              /** account for this bank, user can change it in settings (BBL has AAT + BK692) */
+              public static String account(Context c, String bank) {
+                  String v = p(c).getString("acc_" + bank, "");
+                  return v.isEmpty() ? account(bank) : v;
+              }
+
+              /** masked account number in slip / notification, e.g. 607-0-xxx690 -> AAT, xxx692 -> BK692 */
+              private static final java.util.regex.Pattern MASK = java.util.regex.Pattern.compile(
+                  "[xX*•]{2,}[\\s-]?([0-9]{3,4})(?![0-9])");
+
+              /** user mapping "690=AAT;692=BK692" (last 3 digits -> account), works for every bank */
+              public static java.util.LinkedHashMap<String, String> digitMap(Context c) {
+                  java.util.LinkedHashMap<String, String> m = new java.util.LinkedHashMap<>();
+                  String raw = p(c).getString("digits", "690=AAT;692=BK692");
+                  for (String part : raw.split(";")) {
+                      int i = part.indexOf('=');
+                      if (i == 3) m.put(part.substring(0, 3), part.substring(4));
+                  }
+                  return m;
+              }
+
+              public static void saveDigitMap(Context c, java.util.Map<String, String> m) {
+                  StringBuilder sb = new StringBuilder();
+                  for (java.util.Map.Entry<String, String> e : m.entrySet()) {
+                      if (sb.length() > 0) sb.append(';');
+                      sb.append(e.getKey()).append('=').append(e.getValue().replace(";", " "));
+                  }
+                  p(c).edit().putString("digits", sb.toString()).apply();
+              }
+
+              /** last 3 digits of first masked account number in text, or null */
+              public static String lastDigits(String text) {
+                  if (text == null) return null;
+                  java.util.regex.Matcher m = MASK.matcher(text);
+                  if (!m.find()) return null;
+                  String d = m.group(1);
+                  return d.substring(d.length() - 3);
+              }
+
+              public static String byDigits(Context c, String text) {
+                  if (text == null) return null;
+                  java.util.Map<String, String> map = digitMap(c);
+                  java.util.regex.Matcher m = MASK.matcher(text);
+                  while (m.find()) {
+                      String d = m.group(1);
+                      String acc = map.get(d.substring(d.length() - 3));
+                      if (acc != null) return acc;
+                  }
+                  return null;
+              }
+
+              public static void setAccount(Context c, String bank, String acc) {
+                  p(c).edit().putString("acc_" + bank, acc).apply();
               }
 
               private static SharedPreferences p(Context c) {
@@ -655,6 +710,19 @@ jobs:
               private static final Pattern MONEY = Pattern.compile(
                   "(?<![0-9.,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\\.([0-9]{2})(?![0-9]|\\.[0-9])");
 
+              /** full OCR text, call from a background thread */
+              public static String readText(Context ctx, File f) {
+                  try {
+                      InputImage img = InputImage.fromFilePath(ctx, Uri.fromFile(f));
+                      synchronized (Slip.class) {
+                          if (rec == null) rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                      }
+                      return Tasks.await(rec.process(img)).getText();
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
               /** call from a background thread */
               public static String readAmount(Context ctx, File f) {
                   try {
@@ -781,16 +849,21 @@ jobs:
               }
 
               private void handleNotification(String pkg, String title, String text, long when) {
+                  if (hidden(text) || hidden(title)) {
+                      handleHidden(pkg, when);
+                      return;
+                  }
                   BankParser.Result r = BankParser.parse(pkg, title, text);
                   Util.debug(this, (r != null ? "OK " + r.amount : "X อ่านยอดไม่ได้") + " | " + pkg + " | " + title + " | " + text);
                   if (r == null) return;
                   Db db = Db.get(this);
-                  if (db.duplicate(r.bank, Util.account(r.bank), r.amount, when - 120000L)) return;
+                  if (db.duplicate(r.bank, Util.account(this, r.bank), r.amount, when - 120000L)) return;
 
                   // money left one of my accounts and arrived in another -> one transfer
                   Db.Tx p = db.pair(1 - r.type, r.amount, when - 600000L, r.bank);
                   if (p != null) {
-                      String me = Util.account(r.bank);
+                      String me = Util.byDigits(this, title + " " + text);
+                      if (me == null) me = Util.account(this, r.bank);
                       db.addAccount(me);
                       String from = r.type == 0 ? me : p.account;
                       String to = r.type == 0 ? p.account : me;
@@ -815,12 +888,36 @@ jobs:
 
                   Db.Tx x = new Db.Tx();
                   x.ts = when; x.type = r.type; x.amount = r.amount;
-                  x.account = Util.account(r.bank); x.bank = r.bank; x.note = r.note; x.source = "noti";
+                  String byNo = Util.byDigits(this, title + " " + text);
+                  x.account = byNo != null ? byNo : Util.account(this, r.bank);
+                  x.bank = r.bank; x.note = r.note; x.source = "noti";
                   db.addAccount(x.account);
                   String c = db.shopCategory(Util.key(x.note));
                   if (c != null) x.category = c; else x.needCat = true;
                   db.insert(x);
                   Notifier.saved(this, x, null);
+              }
+
+              /** Android 15+ hides "sensitive" bank notifications from listener apps */
+              private static boolean hidden(String s) {
+                  if (s == null) return false;
+                  String l = s.toLowerCase(java.util.Locale.ROOT);
+                  return l.contains("sensitive notification") || l.contains("content hidden")
+                      || s.contains("ซ่อนเนื้อหา") || s.contains("ถูกซ่อน");
+              }
+
+              private void handleHidden(String pkg, long when) {
+                  String bank = BankParser.BANKS.get(pkg);
+                  Util.debug(this, "ระบบซ่อนข้อความ | " + pkg + " | สร้างรายการรอใส่ยอด");
+                  Db db = Db.get(this);
+                  if (db.recent(bank, "hidden", when - 120000L, false) != null) return;
+                  Db.Tx x = new Db.Tx();
+                  x.ts = when; x.type = 0; x.amount = 0;
+                  x.account = Util.account(this, bank); x.bank = bank; x.source = "hidden";
+                  x.note = bank + " (Android ซ่อนยอด)";
+                  db.addAccount(x.account);
+                  db.insert(x);
+                  Notifier.saved(this, x, "⚠️ ระบบซ่อนยอด แตะเพื่อใส่ยอด");
               }
 
               // ---------- slip images saved by bank apps ----------
@@ -879,20 +976,40 @@ jobs:
                   long now = System.currentTimeMillis();
                   String b = "SLIP".equals(bank) ? null : bank;
 
+                  // hidden notification waiting for amount -> attach slip and read amount from it
+                  String ocr = Slip.readText(this, Photos.file(this, name));
+                  String a = ocr == null ? null : Slip.pick(ocr);
+                  String acc = Util.byDigits(this, ocr);
+                  if (acc != null) Util.debug(this, "สลิปจากบัญชี " + acc);
+                  else if (Util.lastDigits(ocr) != null) Util.debug(this, "สลิปมีเลขบัญชี xxx" + Util.lastDigits(ocr) + " แต่ยังไม่ได้ผูกบัญชี (ไปที่ตั้งค่า)");
+
+                  Db.Tx h = db.recent(b, "hidden", now - 600000L, true);
+                  if (h != null) {
+                      h.photo = name;
+                      if (acc != null) { h.account = acc; db.addAccount(acc); }
+                      try { if (a != null) h.amount = Double.parseDouble(a); } catch (Exception ignored) { }
+                      h.source = "slip"; h.needAi = true; h.note = "สลิป " + h.bank;
+                      db.update(h);
+                      Util.debug(this, "แนบสลิปกับรายการที่ถูกซ่อน " + (a == null ? "(อ่านยอดไม่ได้)" : a));
+                      Notifier.saved(this, h, "📷 จากสลิป (ตรวจยอด)");
+                      return;
+                  }
+
                   // notification already saved this payment -> just attach the photo
                   Db.Tx t = db.recent(b, "noti", now - 300000L, true);
                   if (t != null) {
                       t.photo = name;
+                      if (acc != null && t.type != 2) { t.account = acc; db.addAccount(acc); }
                       db.update(t);
                       Util.debug(this, "แนบรูปสลิปกับรายการ " + Util.money(t.amount));
                       return;
                   }
 
-                  String amt = Slip.readAmount(this, Photos.file(this, name));
+                  String amt = a;
                   Db.Tx x = new Db.Tx();
                   x.ts = now; x.type = 0;
                   try { x.amount = amt == null ? 0 : Double.parseDouble(amt); } catch (Exception e) { x.amount = 0; }
-                  x.account = Util.account(bank); x.bank = bank; x.note = "สลิป " + bank;
+                  x.account = acc != null ? acc : Util.account(this, bank); x.bank = bank; x.note = "สลิป " + bank;
                   x.photo = name; x.source = "slip"; x.needAi = true;
                   db.addAccount(x.account);
                   db.insert(x);
@@ -1717,7 +1834,7 @@ jobs:
                   LinearLayout mid = new LinearLayout(this);
                   mid.setOrientation(LinearLayout.VERTICAL);
                   mid.addView(Ui.one(text(15, Ui.DARK, t.type == 2 ? t.account + " → " + t.toAccount : t.note.isEmpty() ? c : t.note)));
-                  boolean check = "slip".equals(t.source) && (t.needAi || t.amount == 0);
+                  boolean check = t.amount == 0 || ("slip".equals(t.source) && t.needAi);
                   mid.addView(Ui.one(text(12, Ui.GRAY, (t.type == 2 ? "ไม่นับในรายรับ/รายจ่าย" : t.account) + "   " + hm.format(new Date(t.ts))
                       + (t.photo.isEmpty() ? "" : "   📷") + (check ? "   ⚠️ตรวจยอด" : ""))));
                   r.addView(mid, new LinearLayout.LayoutParams(0, WRAP, 1f));
@@ -1983,6 +2100,63 @@ jobs:
                       toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
                   }));
                   c.addView(btn("4. ตรวจ / ดาวน์โหลด AI ในเครื่อง", v -> setupAi()));
+
+                  LinearLayout ba = card();
+                  ba.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  ba.addView(text(15, Ui.DARK, "บันทึกแจ้งเตือนธนาคารเข้าบัญชี"));
+                  String[][] banks = { { "BBL", "บัวหลวง" }, { "KTB", "กรุงไทย" }, { "KMA", "กรุงศรี" }, { "GSB", "ออมสิน" }, { "TrueMoney", "TrueMoney" } };
+                  for (String[] bk : banks) {
+                      final String code = bk[0], label = bk[1];
+                      ba.addView(btn(label + "  →  " + Util.account(this, code) + "  (แตะเพื่อเปลี่ยน)", v -> {
+                          final List<String> accs = Db.get(this).accounts();
+                          new AlertDialog.Builder(this)
+                              .setTitle("แจ้งเตือน" + label + " บันทึกเข้าบัญชี")
+                              .setItems(accs.toArray(new String[0]), (d, w) -> {
+                                  Util.setAccount(this, code, accs.get(w));
+                                  toast(label + " → " + accs.get(w));
+                                  render();
+                              })
+                              .show();
+                      }));
+                  }
+                  ba.addView(text(12, Ui.GRAY, "ใช้เมื่อสลิป/แจ้งเตือนไม่มีเลขบัญชี"));
+
+                  LinearLayout dg = card();
+                  dg.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  dg.addView(text(15, Ui.DARK, "เลขบัญชี 3 ตัวท้าย → บัญชี (ทุกธนาคาร)"));
+                  final Map<String, String> dm = Util.digitMap(this);
+                  for (Map.Entry<String, String> en : dm.entrySet()) {
+                      final String k = en.getKey();
+                      dg.addView(btn("xxx" + k + "  →  " + en.getValue() + "   (แตะเพื่อลบ)", v -> new AlertDialog.Builder(this)
+                          .setMessage("ลบ xxx" + k + "?")
+                          .setPositiveButton("ลบ", (d, w) -> { dm.remove(k); Util.saveDigitMap(this, dm); render(); })
+                          .setNegativeButton("ยกเลิก", null)
+                          .show()));
+                  }
+                  dg.addView(btn("+ เพิ่มเลขบัญชี", v -> {
+                      android.widget.EditText e = new android.widget.EditText(this);
+                      e.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+                      e.setHint("เช่น 123");
+                      new AlertDialog.Builder(this)
+                          .setTitle("เลขบัญชี 3 ตัวท้าย")
+                          .setView(e)
+                          .setPositiveButton("ถัดไป", (d, w) -> {
+                              String no = e.getText().toString().trim();
+                              if (no.length() != 3) { toast("ใส่ 3 หลัก"); return; }
+                              final List<String> accs = Db.get(this).accounts();
+                              new AlertDialog.Builder(this)
+                                  .setTitle("xxx" + no + " คือบัญชี")
+                                  .setItems(accs.toArray(new String[0]), (d2, w2) -> {
+                                      dm.put(no, accs.get(w2));
+                                      Util.saveDigitMap(this, dm);
+                                      render();
+                                  })
+                                  .show();
+                          })
+                          .setNegativeButton("ยกเลิก", null)
+                          .show();
+                  }));
+                  dg.addView(text(12, Ui.GRAY, "ถ้าเจอเลขนี้ในสลิปหรือแจ้งเตือน จะบันทึกเข้าบัญชีนั้นก่อนเสมอ"));
 
                   LinearLayout d2 = card();
                   d2.setPadding(dp(16), dp(12), dp(16), dp(12));
