@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v1 auto expense book)
+name: Build AutoBook APK (v3 transfers + balance)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -90,7 +90,8 @@ jobs:
                   android:icon="@android:drawable/ic_menu_agenda"
                   android:label="AutoBook"
                   android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
-                  <activity android:name=".MainActivity" android:exported="true">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -127,9 +128,9 @@ jobs:
           public class Db extends SQLiteOpenHelper {
               public static class Tx {
                   public long id = 0, ts = 0;
-                  public int type = 0;            // 0 = expense, 1 = income
+                  public int type = 0;            // 0 expense, 1 income, 2 transfer, 3 balance adjust (signed)
                   public double amount = 0;
-                  public String account = "", category = "", note = "", photo = "", source = "manual", bank = "";
+                  public String toAccount = "", account = "", category = "", note = "", photo = "", source = "manual", bank = "";
                   public boolean needAi = false, needCat = false;
               }
 
@@ -145,14 +146,14 @@ jobs:
               }
 
               private Db(Context c) {
-                  super(c, "book.db", null, 1);
+                  super(c, "book.db", null, 2);
                   setWriteAheadLoggingEnabled(false); // single file -> easy backup
               }
 
               @Override
               public void onCreate(SQLiteDatabase d) {
                   d.execSQL("CREATE TABLE tx (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type INTEGER, amount REAL, "
-                      + "account TEXT, category TEXT, note TEXT, photo TEXT, source TEXT, bank TEXT, "
+                      + "account TEXT, category TEXT, note TEXT, photo TEXT, source TEXT, bank TEXT, to_account TEXT DEFAULT '', "
                       + "need_ai INTEGER DEFAULT 0, need_cat INTEGER DEFAULT 0)");
                   d.execSQL("CREATE INDEX tx_ts ON tx(ts)");
                   d.execSQL("CREATE TABLE cat (name TEXT, type INTEGER, ord INTEGER, PRIMARY KEY(name, type))");
@@ -180,7 +181,9 @@ jobs:
               }
 
               @Override
-              public void onUpgrade(SQLiteDatabase d, int o, int n) { }
+              public void onUpgrade(SQLiteDatabase d, int o, int n) {
+                  if (o < 2) d.execSQL("ALTER TABLE tx ADD COLUMN to_account TEXT DEFAULT ''");
+              }
 
               private static String s(String x) { return x == null ? "" : x; }
 
@@ -188,7 +191,7 @@ jobs:
                   ContentValues v = new ContentValues();
                   v.put("ts", t.ts); v.put("type", t.type); v.put("amount", t.amount);
                   v.put("account", s(t.account)); v.put("category", s(t.category)); v.put("note", s(t.note));
-                  v.put("photo", s(t.photo)); v.put("source", s(t.source)); v.put("bank", s(t.bank));
+                  v.put("photo", s(t.photo)); v.put("source", s(t.source)); v.put("bank", s(t.bank)); v.put("to_account", s(t.toAccount));
                   v.put("need_ai", t.needAi ? 1 : 0); v.put("need_cat", t.needCat ? 1 : 0);
                   return v;
               }
@@ -205,6 +208,7 @@ jobs:
                   t.photo = s(c.getString(c.getColumnIndexOrThrow("photo")));
                   t.source = s(c.getString(c.getColumnIndexOrThrow("source")));
                   t.bank = s(c.getString(c.getColumnIndexOrThrow("bank")));
+                  t.toAccount = s(c.getString(c.getColumnIndexOrThrow("to_account")));
                   t.needAi = c.getInt(c.getColumnIndexOrThrow("need_ai")) == 1;
                   t.needCat = c.getInt(c.getColumnIndexOrThrow("need_cat")) == 1;
                   return t;
@@ -249,9 +253,16 @@ jobs:
               }
 
               /** same bank + same amount recently (bank apps often post the same notification twice) */
-              public boolean duplicate(String bank, double amount, long since) {
-                  return !query("bank=? AND ABS(amount-?)<0.005 AND ts>?",
-                      new String[] { bank, String.valueOf(amount), String.valueOf(since) }, null).isEmpty();
+              public boolean duplicate(String bank, String account, double amount, long since) {
+                  return !query("(bank=? OR (type=2 AND to_account=?)) AND ABS(amount-?)<0.005 AND ts>?",
+                      new String[] { bank, account, String.valueOf(amount), String.valueOf(since) }, null).isEmpty();
+              }
+
+              /** other side of a transfer: opposite direction, same amount, another bank, recent */
+              public Tx pair(int type, double amount, long since, String notBank) {
+                  List<Tx> l = query("type=? AND source IN ('noti','slip') AND bank<>'' AND bank<>? AND ABS(amount-?)<0.005 AND ts>?",
+                      new String[] { String.valueOf(type), notBank, String.valueOf(amount), String.valueOf(since) }, "ts DESC");
+                  return l.isEmpty() ? null : l.get(0);
               }
 
               /** latest tx from this bank (null = any bank) since time, optionally only without photo */
@@ -697,8 +708,9 @@ jobs:
                   i.putExtra("id", t.id);
                   PendingIntent pi = PendingIntent.getActivity(ctx, (int) t.id, i,
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                  String title = "บันทึกแล้ว " + (t.type == 1 ? "+" : "-") + Util.money(t.amount) + " บาท · " + t.account;
-                  String text = (t.category.isEmpty() ? "ยังไม่มีหมวด (เปิดแอปให้ AI จัด)" : t.category)
+                  String title = t.type == 2 ? "บันทึกโอน " + Util.money(t.amount) + " บาท · " + t.account + " → " + t.toAccount
+                      : "บันทึกแล้ว " + (t.type == 1 ? "+" : "-") + Util.money(t.amount) + " บาท · " + t.account;
+                  String text = t.type == 2 ? "ไม่นับเป็นรายรับ/รายจ่าย · แตะเพื่อแก้ไข" : (t.category.isEmpty() ? "ยังไม่มีหมวด (เปิดแอปให้ AI จัด)" : t.category)
                       + (extra == null ? "" : " " + extra) + " · แตะเพื่อแก้ไข";
                   Notification n = new Notification.Builder(ctx, CH)
                       .setSmallIcon(android.R.drawable.ic_menu_agenda)
@@ -773,7 +785,23 @@ jobs:
                   Util.debug(this, (r != null ? "OK " + r.amount : "X อ่านยอดไม่ได้") + " | " + pkg + " | " + title + " | " + text);
                   if (r == null) return;
                   Db db = Db.get(this);
-                  if (db.duplicate(r.bank, r.amount, when - 120000L)) return;
+                  if (db.duplicate(r.bank, Util.account(r.bank), r.amount, when - 120000L)) return;
+
+                  // money left one of my accounts and arrived in another -> one transfer
+                  Db.Tx p = db.pair(1 - r.type, r.amount, when - 600000L, r.bank);
+                  if (p != null) {
+                      String me = Util.account(r.bank);
+                      db.addAccount(me);
+                      String from = r.type == 0 ? me : p.account;
+                      String to = r.type == 0 ? p.account : me;
+                      p.type = 2; p.account = from; p.toAccount = to; p.category = "";
+                      p.needCat = false; p.needAi = false; p.source = "noti";
+                      p.note = "โอน " + from + " → " + to;
+                      db.update(p);
+                      Util.debug(this, "จับคู่เป็นโอน " + from + " → " + to + " " + r.amount);
+                      Notifier.saved(this, p, null);
+                      return;
+                  }
 
                   // slip image arrived first -> fill in the real amount
                   Db.Tx slip = db.recent(r.bank, "slip", when - 300000L, false);
@@ -881,7 +909,7 @@ jobs:
           import android.database.sqlite.SQLiteDatabase;
           import java.io.File;
 
-          /** Imports income/expense from a Money Manager .mmbak backup (transfers are skipped). */
+          /** Imports income/expense from a Money Manager .mmbak backup (incl. transfers + balance adjustments). */
           public class Importer {
               private static String s(String x) { return x == null ? "" : x.trim(); }
 
@@ -890,10 +918,12 @@ jobs:
                   Db db = Db.get(c);
                   SQLiteDatabase dst = db.getWritableDatabase();
                   int n = 0;
-                  String sql = "SELECT i.ZDATE, CAST(i.DO_TYPE AS INTEGER), i.ZMONEY, i.ZCONTENT, a.NIC_NAME, g.NAME "
+                  String sql = "SELECT i.ZDATE, CAST(i.DO_TYPE AS INTEGER), i.ZMONEY, i.ZCONTENT, a.NIC_NAME, g.NAME, b.NIC_NAME "
                       + "FROM INOUTCOME i LEFT JOIN ASSETS a ON a.uid = i.assetUid "
+                      + "LEFT JOIN ASSETS b ON b.uid = i.toAssetUid "
                       + "LEFT JOIN ZCATEGORY g ON g.uid = i.ctgUid "
-                      + "WHERE IFNULL(i.IS_DEL, 0) = 0 AND CAST(i.DO_TYPE AS INTEGER) IN (0, 1)";
+                      + "WHERE IFNULL(i.IS_DEL, 0) = 0 AND CAST(i.DO_TYPE AS INTEGER) IN (0, 1, 3, 7, 8)";
+                  int tr = 0;
                   try (Cursor cur = src.rawQuery(sql, null)) {
                       dst.beginTransaction();
                       try {
@@ -906,15 +936,29 @@ jobs:
                               } catch (Exception e) {
                                   continue;
                               }
-                              t.type = cur.getInt(1) == 1 ? 0 : 1;
+                              int mt = cur.getInt(1);
                               t.note = s(cur.getString(3));
                               t.account = s(cur.getString(4));
                               if (t.account.isEmpty()) t.account = "ไม่ระบุบัญชี";
-                              t.category = s(cur.getString(5));
                               t.source = "mm";
+                              if (mt == 3) {
+                                  t.type = 2;
+                                  t.toAccount = s(cur.getString(6));
+                                  if (t.toAccount.isEmpty()) continue;
+                                  if (t.note.isEmpty()) t.note = "โอน " + t.account + " → " + t.toAccount;
+                                  db.addAccount(t.toAccount);
+                                  tr++;
+                              } else if (mt == 7 || mt == 8) {
+                                  t.type = 3;
+                                  if (mt == 8) t.amount = -t.amount;
+                                  t.note = "ปรับยอด" + (t.note.isEmpty() ? "" : " (" + t.note + ")");
+                              } else {
+                                  t.type = mt == 1 ? 0 : 1;
+                                  t.category = s(cur.getString(5));
+                              }
                               db.insert(t);
                               db.addAccount(t.account);
-                              if (!t.category.isEmpty()) {
+                              if (t.type <= 1 && !t.category.isEmpty()) {
                                   db.addCategory(t.category, t.type);
                                   if (!t.note.isEmpty()) db.rememberShop(Util.key(t.note), t.category);
                               }
@@ -927,7 +971,59 @@ jobs:
                   } finally {
                       src.close();
                   }
-                  return "นำเข้า " + n + " รายการแล้ว (ไม่รวมการโอนระหว่างบัญชี)";
+                  return "นำเข้า " + n + " รายการแล้ว (รวมการโอน " + tr + " รายการ)";
+              }
+          }
+          EOF
+
+          cat > $J/Ui.java << 'EOF'
+          package com.example.autobook;
+
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.text.TextUtils;
+          import android.view.View;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class Ui {
+              public static final int RED = Color.rgb(244, 81, 81);
+              public static final int BLUE = Color.rgb(30, 136, 229);
+              public static final int BG = Color.rgb(242, 242, 242);
+              public static final int DARK = Color.rgb(33, 33, 33);
+              public static final int GRAY = Color.rgb(150, 150, 150);
+              public static final int LINE = Color.rgb(228, 228, 228);
+
+              public static int dp(Context c, float v) { return Math.round(v * c.getResources().getDisplayMetrics().density); }
+
+              public static GradientDrawable round(int fill, float radius, int stroke, int strokeW) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(fill);
+                  g.setCornerRadius(radius);
+                  if (strokeW > 0) g.setStroke(strokeW, stroke);
+                  return g;
+              }
+
+              public static TextView text(Context c, float size, int color, String s) {
+                  TextView t = new TextView(c);
+                  t.setTextSize(size);
+                  t.setTextColor(color);
+                  t.setText(s);
+                  return t;
+              }
+
+              public static TextView one(TextView t) {
+                  t.setSingleLine(true);
+                  t.setEllipsize(TextUtils.TruncateAt.END);
+                  return t;
+              }
+
+              public static View line(Context c) {
+                  View v = new View(c);
+                  v.setBackgroundColor(LINE);
+                  v.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1));
+                  return v;
               }
           }
           EOF
@@ -943,16 +1039,17 @@ jobs:
           import android.content.Intent;
           import android.graphics.Bitmap;
           import android.graphics.Color;
+          import android.graphics.Typeface;
           import android.os.Bundle;
           import android.text.InputType;
+          import android.view.Gravity;
           import android.view.View;
-          import android.widget.ArrayAdapter;
           import android.widget.Button;
           import android.widget.EditText;
+          import android.widget.GridLayout;
           import android.widget.ImageView;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
-          import android.widget.Spinner;
           import android.widget.TextView;
           import android.widget.Toast;
           import java.text.SimpleDateFormat;
@@ -961,16 +1058,21 @@ jobs:
           import java.util.Date;
           import java.util.List;
           import java.util.Locale;
+          import java.util.function.Consumer;
 
           public class EditActivity extends Activity {
               private static final int PICK = 21;
+              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT, MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
               private Db db;
               private Db.Tx t;
               private EditText amount, note;
-              private Spinner acc, cat;
-              private Button typeBtn, dateBtn;
+              private TextView tabIn, tabEx, tabTr, dateV, catV, accV, toV;
+              private LinearLayout catRow, toRow;
+              private View lineIn, lineEx, lineTr;
+              private Button save, removePhoto;
               private ImageView photo;
-              private Button removePhoto;
+
+              private int dp(float v) { return Ui.dp(this, v); }
 
               @Override
               protected void onCreate(Bundle s) {
@@ -980,66 +1082,86 @@ jobs:
                   if (id > 0) t = db.get(id);
                   if (t == null) {
                       t = new Db.Tx();
-                      t.ts = System.currentTimeMillis();
+                      t.ts = getIntent().getLongExtra("ts", 0L);
+                      if (t.ts <= 0) t.ts = System.currentTimeMillis();
                       List<String> a = db.accounts();
                       t.account = a.isEmpty() ? "Cash" : a.get(0);
                   }
-                  setTitle(t.id > 0 ? "แก้ไขรายการ" : "เพิ่มรายการ");
+                  setTitle(t.type == 3 ? "ปรับยอด (ไม่นับเป็นรายรับ/รายจ่าย)" : t.id > 0 ? "แก้ไขรายการ" : "เพิ่มรายการ");
 
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(36, 24, 36, 36);
+                  root.setBackgroundColor(Color.WHITE);
 
-                  typeBtn = new Button(this);
-                  typeBtn.setOnClickListener(v -> {
-                      String keep = selectedCat();
-                      t.type = 1 - t.type;
-                      showType();
-                      fillCats(keep);
-                  });
-                  root.addView(label("ประเภท (แตะเพื่อสลับ)"));
-                  root.addView(typeBtn);
+                  LinearLayout tabs = new LinearLayout(this);
+                  tabIn = Ui.text(this, 16, Ui.GRAY, "รายรับ");
+                  tabEx = Ui.text(this, 16, Ui.GRAY, "รายจ่าย");
+                  lineIn = new View(this);
+                  lineEx = new View(this);
+                  tabTr = Ui.text(this, 16, Ui.GRAY, "โอน");
+                  lineTr = new View(this);
+                  tabs.addView(tab(tabIn, lineIn, 1));
+                  tabs.addView(tab(tabEx, lineEx, 0));
+                  tabs.addView(tab(tabTr, lineTr, 2));
+                  root.addView(tabs);
+                  root.addView(Ui.line(this));
 
-                  root.addView(label("จำนวนเงิน (บาท)"));
+                  dateV = value();
+                  dateV.setOnClickListener(v -> pickDate());
+                  row(root, "วันที่", dateV);
+
                   amount = new EditText(this);
-                  amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-                  amount.setTextSize(26f);
+                  amount.setBackground(null);
+                  amount.setPadding(0, 0, 0, 0);
+                  amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
+                  amount.setTextSize(22f);
                   amount.setHint("0.00");
-                  if (t.amount > 0) amount.setText(String.format(Locale.US, "%.2f", t.amount));
-                  root.addView(amount);
+                  if (t.amount != 0) amount.setText(String.format(Locale.US, "%.2f", t.amount));
+                  row(root, "จำนวนเงิน", amount);
 
-                  root.addView(label("บัญชี"));
-                  acc = new Spinner(this);
-                  root.addView(acc);
-                  fillAccs();
+                  catV = value();
+                  catV.setOnClickListener(v -> pick("หมวดหมู่", db.categories(t.type), name -> {
+                      db.addCategory(name, t.type);
+                      t.category = name;
+                      showValues();
+                  }));
+                  catRow = row(root, "หมวดหมู่", catV);
 
-                  root.addView(label("หมวด"));
-                  cat = new Spinner(this);
-                  root.addView(cat);
-                  fillCats(t.category);
-                  Button addCat = new Button(this);
-                  addCat.setText("+ หมวดใหม่");
-                  addCat.setOnClickListener(v -> newCategory());
-                  root.addView(addCat);
+                  accV = value();
+                  accV.setOnClickListener(v -> pick("บัญชี", db.accounts(), name -> {
+                      db.addAccount(name);
+                      t.account = name;
+                      showValues();
+                  }));
+                  row(root, "บัญชี", accV);
 
-                  root.addView(label("ร้าน / บันทึก"));
+                  toV = value();
+                  toV.setOnClickListener(v -> pick("ไปยังบัญชี", db.accounts(), name -> {
+                      db.addAccount(name);
+                      t.toAccount = name;
+                      showValues();
+                  }));
+                  toRow = row(root, "ไปยัง", toV);
+
                   note = new EditText(this);
+                  note.setBackground(null);
+                  note.setPadding(0, 0, 0, 0);
+                  note.setTextSize(16f);
+                  note.setHint("ร้าน / รายละเอียด");
                   note.setText(t.note);
-                  root.addView(note);
+                  row(root, "บันทึก", note);
 
-                  root.addView(label("วันเวลา"));
-                  dateBtn = new Button(this);
-                  dateBtn.setOnClickListener(v -> pickDate());
-                  root.addView(dateBtn);
-
-                  root.addView(label("รูปสลิป / ใบเสร็จ"));
+                  LinearLayout ph = new LinearLayout(this);
+                  ph.setOrientation(LinearLayout.VERTICAL);
+                  ph.setPadding(dp(16), dp(12), dp(16), 0);
                   photo = new ImageView(this);
                   photo.setAdjustViewBounds(true);
-                  photo.setMaxHeight(900);
+                  photo.setMaxHeight(dp(320));
                   photo.setOnClickListener(v -> showFullPhoto());
-                  root.addView(photo);
+                  ph.addView(photo);
                   LinearLayout pr = new LinearLayout(this);
                   Button attach = new Button(this);
+                  attach.setAllCaps(false);
                   attach.setText("📷 แนบรูป");
                   attach.setOnClickListener(v -> {
                       Intent i = new Intent(Intent.ACTION_GET_CONTENT);
@@ -1048,21 +1170,27 @@ jobs:
                   });
                   pr.addView(attach);
                   removePhoto = new Button(this);
+                  removePhoto.setAllCaps(false);
                   removePhoto.setText("ลบรูป");
                   removePhoto.setOnClickListener(v -> { t.photo = ""; showPhoto(); });
                   pr.addView(removePhoto);
-                  root.addView(pr);
+                  ph.addView(pr);
+                  root.addView(ph);
 
-                  Button save = new Button(this);
-                  save.setText("💾 บันทึก");
-                  save.setTextSize(18f);
+                  save = new Button(this);
+                  save.setAllCaps(false);
+                  save.setText("บันทึก");
+                  save.setTextColor(Color.WHITE);
+                  save.setTextSize(17f);
                   save.setOnClickListener(v -> save());
-                  root.addView(save);
+                  LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(MATCH, dp(52));
+                  sp.setMargins(dp(16), dp(20), dp(16), dp(8));
+                  root.addView(save, sp);
 
                   if (t.id > 0) {
-                      Button del = new Button(this);
-                      del.setText("🗑 ลบรายการนี้");
-                      del.setTextColor(Color.RED);
+                      TextView del = Ui.text(this, 15, Ui.GRAY, "🗑 ลบรายการนี้");
+                      del.setGravity(Gravity.CENTER);
+                      del.setPadding(0, dp(14), 0, dp(24));
                       del.setOnClickListener(v -> new AlertDialog.Builder(this)
                           .setMessage("ลบรายการนี้?")
                           .setPositiveButton("ลบ", (d, w) -> {
@@ -1076,28 +1204,105 @@ jobs:
                   }
 
                   ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.WHITE);
                   sv.addView(root);
                   setContentView(sv);
-                  showType();
-                  showDate();
+                  styleTabs();
+                  showValues();
                   showPhoto();
               }
 
-              private TextView label(String s) {
-                  TextView tv = new TextView(this);
-                  tv.setText(s);
-                  tv.setTextColor(Color.DKGRAY);
-                  tv.setPadding(0, 24, 0, 0);
-                  return tv;
+              private LinearLayout tab(TextView tv, View line, int type) {
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  l.setGravity(Gravity.CENTER_HORIZONTAL);
+                  tv.setPadding(0, dp(14), 0, dp(10));
+                  l.addView(tv);
+                  l.addView(line, new LinearLayout.LayoutParams(MATCH, dp(3)));
+                  l.setOnClickListener(v -> { t.type = type; styleTabs(); });
+                  l.setLayoutParams(new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  return l;
               }
 
-              private void showType() {
-                  typeBtn.setText(t.type == 1 ? "รายรับ" : "รายจ่าย");
-                  typeBtn.setTextColor(t.type == 1 ? Color.rgb(25, 118, 210) : Color.rgb(211, 47, 47));
+              private void styleTabs() {
+                  boolean inc = t.type == 1, exp = t.type == 0, tr = t.type == 2;
+                  tabIn.setTextColor(inc ? Ui.BLUE : Ui.GRAY);
+                  tabIn.setTypeface(null, inc ? Typeface.BOLD : Typeface.NORMAL);
+                  lineIn.setBackgroundColor(inc ? Ui.BLUE : Color.TRANSPARENT);
+                  tabEx.setTextColor(exp ? Ui.RED : Ui.GRAY);
+                  tabEx.setTypeface(null, exp ? Typeface.BOLD : Typeface.NORMAL);
+                  lineEx.setBackgroundColor(exp ? Ui.RED : Color.TRANSPARENT);
+                  tabTr.setTextColor(tr ? Ui.DARK : Ui.GRAY);
+                  tabTr.setTypeface(null, tr ? Typeface.BOLD : Typeface.NORMAL);
+                  lineTr.setBackgroundColor(tr ? Ui.DARK : Color.TRANSPARENT);
+                  save.setBackground(Ui.round(inc ? Ui.BLUE : exp ? Ui.RED : Ui.DARK, dp(8), 0, 0));
+                  catRow.setVisibility(t.type <= 1 ? View.VISIBLE : View.GONE);
+                  toRow.setVisibility(tr ? View.VISIBLE : View.GONE);
+                  ((TextView) ((LinearLayout) accV.getParent()).getChildAt(0)).setText(tr ? "จาก" : "บัญชี");
               }
 
-              private void showDate() {
-                  dateBtn.setText(new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US).format(new Date(t.ts)));
+              private TextView value() { return Ui.text(this, 16, Ui.DARK, ""); }
+
+              private LinearLayout row(LinearLayout root, String label, View v) {
+                  LinearLayout r = new LinearLayout(this);
+                  r.setGravity(Gravity.CENTER_VERTICAL);
+                  r.setPadding(dp(16), dp(14), dp(16), dp(14));
+                  r.addView(Ui.text(this, 14, Ui.GRAY, label), new LinearLayout.LayoutParams(dp(90), WRAP));
+                  r.addView(v, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  root.addView(r);
+                  root.addView(Ui.line(this));
+                  return r;
+              }
+
+              private void showValues() {
+                  dateV.setText(new SimpleDateFormat("dd/MM/yyyy (EEE)   HH:mm", new Locale("th", "TH")).format(new Date(t.ts)));
+                  catV.setText(t.category.isEmpty() ? "เลือกหมวด ›" : t.category);
+                  catV.setTextColor(t.category.isEmpty() ? Ui.GRAY : Ui.DARK);
+                  accV.setText(t.account.isEmpty() ? "เลือกบัญชี ›" : t.account);
+                  accV.setTextColor(t.account.isEmpty() ? Ui.GRAY : Ui.DARK);
+                  toV.setText(t.toAccount.isEmpty() ? "เลือกบัญชี ›" : t.toAccount);
+                  toV.setTextColor(t.toAccount.isEmpty() ? Ui.GRAY : Ui.DARK);
+              }
+
+              /** Money Manager style grid picker */
+              private void pick(String title, List<String> items, Consumer<String> cb) {
+                  final AlertDialog[] dlg = new AlertDialog[1];
+                  GridLayout g = new GridLayout(this);
+                  g.setColumnCount(3);
+                  g.setPadding(dp(8), dp(8), dp(8), dp(8));
+                  List<String> all = new ArrayList<>(items);
+                  all.add("+ เพิ่ม");
+                  for (String name : all) {
+                      TextView cell = Ui.one(Ui.text(this, 14, name.startsWith("+ ") ? Ui.RED : Ui.DARK, name));
+                      cell.setGravity(Gravity.CENTER);
+                      cell.setPadding(dp(6), dp(14), dp(6), dp(14));
+                      cell.setBackground(Ui.round(Color.WHITE, dp(6), Ui.LINE, dp(1)));
+                      GridLayout.LayoutParams lp = new GridLayout.LayoutParams(
+                          GridLayout.spec(GridLayout.UNDEFINED), GridLayout.spec(GridLayout.UNDEFINED, 1f));
+                      lp.width = 0;
+                      lp.setMargins(dp(4), dp(4), dp(4), dp(4));
+                      cell.setOnClickListener(v -> {
+                          dlg[0].dismiss();
+                          if (name.startsWith("+ ")) {
+                              EditText e = new EditText(this);
+                              new AlertDialog.Builder(this)
+                                  .setTitle("เพิ่ม" + title)
+                                  .setView(e)
+                                  .setPositiveButton("เพิ่ม", (d, w) -> {
+                                      String n = e.getText().toString().trim();
+                                      if (!n.isEmpty()) cb.accept(n);
+                                  })
+                                  .setNegativeButton("ยกเลิก", null)
+                                  .show();
+                          } else {
+                              cb.accept(name);
+                          }
+                      });
+                      g.addView(cell, lp);
+                  }
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(g);
+                  dlg[0] = new AlertDialog.Builder(this).setTitle(title).setView(sv).show();
               }
 
               private void showPhoto() {
@@ -1117,45 +1322,6 @@ jobs:
                   d.show();
               }
 
-              private void fillAccs() {
-                  List<String> l = new ArrayList<>(db.accounts());
-                  if (!t.account.isEmpty() && !l.contains(t.account)) l.add(t.account);
-                  acc.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l));
-                  int i = l.indexOf(t.account);
-                  if (i >= 0) acc.setSelection(i);
-              }
-
-              private void fillCats(String sel) {
-                  List<String> l = new ArrayList<>();
-                  l.add("(ไม่มีหมวด)");
-                  l.addAll(db.categories(t.type));
-                  if (sel != null && !sel.isEmpty() && !l.contains(sel)) l.add(sel);
-                  cat.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l));
-                  int i = sel == null ? -1 : l.indexOf(sel);
-                  cat.setSelection(Math.max(i, 0));
-              }
-
-              private String selectedCat() {
-                  Object o = cat.getSelectedItem();
-                  String s = o == null ? "" : o.toString();
-                  return s.startsWith("(") ? "" : s;
-              }
-
-              private void newCategory() {
-                  EditText e = new EditText(this);
-                  new AlertDialog.Builder(this)
-                      .setTitle("หมวดใหม่ (" + (t.type == 1 ? "รายรับ" : "รายจ่าย") + ")")
-                      .setView(e)
-                      .setPositiveButton("เพิ่ม", (d, w) -> {
-                          String n = e.getText().toString().trim();
-                          if (n.isEmpty()) return;
-                          db.addCategory(n, t.type);
-                          fillCats(n);
-                      })
-                      .setNegativeButton("ยกเลิก", null)
-                      .show();
-              }
-
               private void pickDate() {
                   final Calendar c = Calendar.getInstance();
                   c.setTimeInMillis(t.ts);
@@ -1165,7 +1331,7 @@ jobs:
                           c.set(Calendar.HOUR_OF_DAY, h);
                           c.set(Calendar.MINUTE, mi);
                           t.ts = c.getTimeInMillis();
-                          showDate();
+                          showValues();
                       }, c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), true).show();
                   }, c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH)).show();
               }
@@ -1178,16 +1344,23 @@ jobs:
                       Toast.makeText(this, "ใส่จำนวนเงินก่อน", Toast.LENGTH_SHORT).show();
                       return;
                   }
+                  if (t.type == 2) {
+                      if (t.toAccount.isEmpty() || t.toAccount.equals(t.account)) {
+                          Toast.makeText(this, "เลือกบัญชีปลายทางที่ไม่ใช่บัญชีเดียวกัน", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      t.category = "";
+                      a = Math.abs(a);
+                  } else if (t.type <= 1) {
+                      a = Math.abs(a);
+                  }
                   t.amount = a;
-                  Object ao = acc.getSelectedItem();
-                  t.account = ao == null ? "" : ao.toString();
-                  t.category = selectedCat();
                   t.note = note.getText().toString().trim();
                   t.needAi = false;
                   t.needCat = false;
                   if (t.id > 0) db.update(t);
                   else db.insert(t);
-                  if (!t.note.isEmpty() && !t.category.isEmpty()) db.rememberShop(Util.key(t.note), t.category);
+                  if (t.type <= 1 && !t.note.isEmpty() && !t.category.isEmpty()) db.rememberShop(Util.key(t.note), t.category);
                   finish();
               }
 
@@ -1227,6 +1400,7 @@ jobs:
           import android.view.Gravity;
           import android.view.View;
           import android.widget.Button;
+          import android.widget.FrameLayout;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
@@ -1242,6 +1416,7 @@ jobs:
           import java.util.Calendar;
           import java.util.Date;
           import java.util.HashMap;
+          import java.util.LinkedHashMap;
           import java.util.List;
           import java.util.Locale;
           import java.util.Map;
@@ -1253,16 +1428,24 @@ jobs:
 
           public class MainActivity extends Activity {
               private static final int REQ_IMPORT = 11, REQ_RESTORE = 12;
+              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT, MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
               private static final Locale TH = new Locale("th", "TH");
-              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT;
-              private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
+              private static final int[] PALETTE = {
+                  Color.rgb(244, 81, 81), Color.rgb(255, 138, 101), Color.rgb(255, 193, 7), Color.rgb(139, 195, 74),
+                  Color.rgb(38, 166, 154), Color.rgb(66, 165, 245), Color.rgb(126, 87, 194), Color.rgb(236, 64, 122),
+                  Color.rgb(141, 110, 99), Color.rgb(120, 144, 156)
+              };
               private final ExecutorService bg = Executors.newSingleThreadExecutor();
               private final Calendar month = Calendar.getInstance();
-              private int page = 0;
+              private int nav = 0, sub = 0, statType = 0;
               private volatile boolean busy = false;
               private volatile int aiStatus = -2;
-              private LinearLayout content;
-              private TextView monthLabel, totals;
+              private LinearLayout monthBar, subTabs, totalsRow, content, bottom;
+              private TextView monthLabel, incT, expT, totT, fab;
+
+              private int dp(float v) { return Ui.dp(this, v); }
+              private TextView text(float s, int c, String str) { return Ui.text(this, s, c, str); }
+              private void toast(String m) { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); }
 
               @Override
               protected void onCreate(Bundle s) {
@@ -1273,40 +1456,58 @@ jobs:
                   month.set(Calendar.SECOND, 0);
                   month.set(Calendar.MILLISECOND, 0);
 
+                  FrameLayout frame = new FrameLayout(this);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(24, 12, 24, 0);
+                  root.setBackgroundColor(Ui.BG);
 
-                  LinearLayout top = new LinearLayout(this);
-                  top.setGravity(Gravity.CENTER_VERTICAL);
-                  top.addView(btn("◀", v -> { month.add(Calendar.MONTH, -1); render(); }));
-                  monthLabel = new TextView(this);
-                  monthLabel.setTextSize(19f);
+                  monthBar = new LinearLayout(this);
+                  monthBar.setGravity(Gravity.CENTER_VERTICAL);
+                  monthBar.setBackgroundColor(Color.WHITE);
+                  monthBar.setPadding(dp(4), dp(10), dp(4), dp(2));
+                  monthBar.addView(arrow("‹", -1));
+                  monthLabel = text(18, Ui.DARK, "");
+                  monthLabel.setTypeface(null, Typeface.BOLD);
                   monthLabel.setGravity(Gravity.CENTER);
-                  top.addView(monthLabel, new LinearLayout.LayoutParams(0, WRAP, 1f));
-                  top.addView(btn("▶", v -> { month.add(Calendar.MONTH, 1); render(); }));
-                  root.addView(top);
+                  monthBar.addView(monthLabel, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  monthBar.addView(arrow("›", 1));
+                  root.addView(monthBar);
 
-                  totals = new TextView(this);
-                  totals.setTextSize(14f);
-                  totals.setGravity(Gravity.CENTER);
-                  root.addView(totals);
+                  subTabs = new LinearLayout(this);
+                  subTabs.setBackgroundColor(Color.WHITE);
+                  root.addView(subTabs);
+                  root.addView(Ui.line(this));
 
-                  LinearLayout tabs = new LinearLayout(this);
-                  String[] names = { "รายการ", "สรุป", "ตั้งค่า" };
-                  for (int i = 0; i < names.length; i++) {
-                      final int p = i;
-                      tabs.addView(btn(names[i], v -> { page = p; render(); }), new LinearLayout.LayoutParams(0, WRAP, 1f));
-                  }
-                  root.addView(tabs);
+                  totalsRow = new LinearLayout(this);
+                  totalsRow.setBackgroundColor(Color.WHITE);
+                  totalsRow.setPadding(0, dp(8), 0, dp(8));
+                  incT = totalCell("รายรับ", Ui.BLUE);
+                  expT = totalCell("รายจ่าย", Ui.RED);
+                  totT = totalCell("รวม", Ui.DARK);
+                  root.addView(totalsRow);
 
                   ScrollView sv = new ScrollView(this);
                   content = new LinearLayout(this);
                   content.setOrientation(LinearLayout.VERTICAL);
-                  content.setPadding(0, 0, 0, 48);
+                  content.setPadding(0, 0, 0, dp(96));
                   sv.addView(content);
                   root.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 1f));
-                  setContentView(root);
+
+                  root.addView(Ui.line(this));
+                  bottom = new LinearLayout(this);
+                  bottom.setBackgroundColor(Color.WHITE);
+                  root.addView(bottom);
+                  frame.addView(root, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+                  fab = text(30, Color.WHITE, "+");
+                  fab.setGravity(Gravity.CENTER);
+                  fab.setBackground(Ui.round(Ui.RED, dp(30), 0, 0));
+                  fab.setElevation(dp(6));
+                  fab.setOnClickListener(v -> openEdit(0, 0));
+                  FrameLayout.LayoutParams fp = new FrameLayout.LayoutParams(dp(60), dp(60), Gravity.BOTTOM | Gravity.END);
+                  fp.setMargins(0, 0, dp(20), dp(76));
+                  frame.addView(fab, fp);
+                  setContentView(frame);
               }
 
               @Override
@@ -1320,6 +1521,58 @@ jobs:
                   processPending();
               }
 
+              private TextView totalCell(String label, int color) {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setGravity(Gravity.CENTER_HORIZONTAL);
+                  box.addView(text(12, Ui.GRAY, label));
+                  TextView v = text(15, color, "0.00");
+                  v.setTypeface(null, Typeface.BOLD);
+                  box.addView(v);
+                  totalsRow.addView(box, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  return v;
+              }
+
+              private TextView arrow(String s, int d) {
+                  TextView a = text(28, Ui.DARK, s);
+                  a.setPadding(dp(18), 0, dp(18), 0);
+                  a.setOnClickListener(v -> {
+                      month.add(nav == 0 && sub == 2 ? Calendar.YEAR : Calendar.MONTH, d);
+                      render();
+                  });
+                  return a;
+              }
+
+              private void openEdit(long id, long ts) {
+                  Intent i = new Intent(this, EditActivity.class);
+                  if (id > 0) i.putExtra("id", id);
+                  if (ts > 0) i.putExtra("ts", ts);
+                  startActivity(i);
+              }
+
+              private List<Db.Tx> range(Calendar start, int field) {
+                  Calendar e = (Calendar) start.clone();
+                  e.add(field, 1);
+                  return Db.get(this).range(start.getTimeInMillis(), e.getTimeInMillis());
+              }
+
+              private LinearLayout card() {
+                  LinearLayout c = new LinearLayout(this);
+                  c.setOrientation(LinearLayout.VERTICAL);
+                  c.setBackgroundColor(Color.WHITE);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  lp.setMargins(0, dp(8), 0, 0);
+                  content.addView(c, lp);
+                  return c;
+              }
+
+              private void note(String s) {
+                  TextView t = text(13, Ui.GRAY, s);
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(dp(16), dp(14), dp(16), dp(14));
+                  content.addView(t);
+              }
+
               private Button btn(String text, View.OnClickListener l) {
                   Button b = new Button(this);
                   b.setText(text);
@@ -1328,144 +1581,422 @@ jobs:
                   return b;
               }
 
-              private TextView tv(float size, String text) {
-                  TextView t = new TextView(this);
-                  t.setTextSize(size);
-                  t.setText(text);
-                  return t;
-              }
-
-              private void toast(String m) { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); }
+              private static String shortMoney(double v) { return String.format(Locale.US, "%,.0f", v); }
 
               // ---------------- screens ----------------
               private void render() {
-                  long from = month.getTimeInMillis();
-                  Calendar e = (Calendar) month.clone();
-                  e.add(Calendar.MONTH, 1);
-                  List<Db.Tx> list = Db.get(this).range(from, e.getTimeInMillis());
-                  double inc = 0, exp = 0;
-                  for (Db.Tx t : list) { if (t.type == 1) inc += t.amount; else exp += t.amount; }
-                  monthLabel.setText(new SimpleDateFormat("MMMM yyyy", TH).format(month.getTime()));
-                  totals.setText("รายรับ " + Util.money(inc) + "   รายจ่าย " + Util.money(exp) + "   คงเหลือ " + Util.money(inc - exp));
+                  boolean yearly = nav == 0 && sub == 2;
+                  monthBar.setVisibility(nav <= 1 ? View.VISIBLE : View.GONE);
+                  totalsRow.setVisibility(nav == 0 ? View.VISIBLE : View.GONE);
+                  fab.setVisibility(nav <= 2 ? View.VISIBLE : View.GONE);
+                  monthLabel.setText(yearly ? String.valueOf(month.get(Calendar.YEAR))
+                      : new SimpleDateFormat("MMMM yyyy", TH).format(month.getTime()));
+                  buildSubTabs();
+                  buildBottom();
                   content.removeAllViews();
-                  if (page == 0) renderList(list);
-                  else if (page == 1) renderSummary(list);
-                  else renderSettings();
+
+                  Calendar start = (Calendar) month.clone();
+                  if (yearly) start.set(Calendar.MONTH, 0);
+                  List<Db.Tx> list = range(start, yearly ? Calendar.YEAR : Calendar.MONTH);
+
+                  if (nav == 0) {
+                      double inc = 0, exp = 0;
+                      for (Db.Tx t : list) { if (t.type == 1) inc += t.amount; else if (t.type == 0) exp += t.amount; }
+                      incT.setText(Util.money(inc));
+                      expT.setText(Util.money(exp));
+                      totT.setText(Util.money(inc - exp));
+                      if (busy) note("🤖 AI กำลังจัดหมวด / อ่านสลิป...");
+                      if (sub == 0) renderDaily(list);
+                      else if (sub == 1) renderCalendar(list);
+                      else renderMonthly();
+                  } else if (nav == 1) {
+                      renderStats(list);
+                  } else if (nav == 2) {
+                      renderAccounts();
+                  } else {
+                      renderSettings();
+                  }
               }
 
-              private void renderList(List<Db.Tx> list) {
-                  content.addView(btn("+ เพิ่มรายการเอง", v -> startActivity(new Intent(this, EditActivity.class))));
-                  if (busy) content.addView(tv(13f, "🤖 AI กำลังจัดหมวด / อ่านสลิป..."));
-                  if (list.isEmpty()) {
-                      content.addView(tv(15f, "\n(เดือนนี้ยังไม่มีรายการ)"));
-                      return;
-                  }
-                  SimpleDateFormat day = new SimpleDateFormat("EEEE d MMM", TH);
-                  SimpleDateFormat hm = new SimpleDateFormat("HH:mm", Locale.US);
-                  String last = "";
-                  for (Db.Tx t : list) {
-                      String d = day.format(new Date(t.ts));
-                      if (!d.equals(last)) {
-                          last = d;
-                          TextView h = tv(14f, "\n" + d);
-                          h.setTypeface(null, Typeface.BOLD);
-                          h.setTextColor(Color.DKGRAY);
-                          content.addView(h);
-                      }
-                      LinearLayout r = new LinearLayout(this);
-                      r.setPadding(0, 14, 0, 14);
-                      r.setGravity(Gravity.CENTER_VERTICAL);
-                      String c = !t.category.isEmpty() ? t.category : (t.needAi || t.needCat ? "🤖 รอ AI" : "❔ ไม่มีหมวด");
-                      boolean check = "slip".equals(t.source) && (t.needAi || t.amount == 0);
-                      TextView left = tv(15f, c + " · " + t.account + (t.photo.isEmpty() ? "" : " 📷")
-                          + (check ? " ⚠️ตรวจยอด" : "")
-                          + "\n" + hm.format(new Date(t.ts)) + "  " + Util.cut(t.note, 40));
-                      r.addView(left, new LinearLayout.LayoutParams(0, WRAP, 1f));
-                      TextView right = tv(16f, (t.type == 1 ? "+" : "-") + Util.money(t.amount));
-                      right.setTextColor(t.type == 1 ? Color.rgb(25, 118, 210) : Color.rgb(211, 47, 47));
-                      r.addView(right);
-                      final long id = t.id;
-                      r.setOnClickListener(v -> {
-                          Intent i = new Intent(this, EditActivity.class);
-                          i.putExtra("id", id);
-                          startActivity(i);
+              private void buildSubTabs() {
+                  subTabs.removeAllViews();
+                  String[] names = nav == 0 ? new String[] { "รายวัน", "ปฏิทิน", "รายเดือน" }
+                      : nav == 1 ? new String[] { "รายจ่าย", "รายรับ" } : null;
+                  subTabs.setVisibility(names == null ? View.GONE : View.VISIBLE);
+                  if (names == null) return;
+                  int sel = nav == 0 ? sub : statType;
+                  for (int i = 0; i < names.length; i++) {
+                      final int idx = i;
+                      LinearLayout tab = new LinearLayout(this);
+                      tab.setOrientation(LinearLayout.VERTICAL);
+                      tab.setGravity(Gravity.CENTER_HORIZONTAL);
+                      TextView tv = text(15, i == sel ? Ui.DARK : Ui.GRAY, names[i]);
+                      tv.setTypeface(null, i == sel ? Typeface.BOLD : Typeface.NORMAL);
+                      tv.setPadding(0, dp(10), 0, dp(8));
+                      tab.addView(tv);
+                      View u = new View(this);
+                      u.setBackgroundColor(i == sel ? Ui.RED : Color.TRANSPARENT);
+                      tab.addView(u, new LinearLayout.LayoutParams(dp(64), dp(3)));
+                      tab.setOnClickListener(v -> {
+                          if (nav == 0) sub = idx; else statType = idx;
+                          render();
                       });
-                      content.addView(r);
+                      subTabs.addView(tab, new LinearLayout.LayoutParams(0, WRAP, 1f));
                   }
               }
 
-              private void renderSummary(List<Db.Tx> list) {
-                  Map<String, Double> byCat = new HashMap<>(), byAcc = new HashMap<>(), byInc = new HashMap<>();
-                  double exp = 0, inc = 0;
+              private void buildBottom() {
+                  bottom.removeAllViews();
+                  String[][] items = { { "📒", "รายการ" }, { "📊", "สถิติ" }, { "💰", "บัญชี" }, { "⚙️", "ตั้งค่า" } };
+                  for (int i = 0; i < items.length; i++) {
+                      final int idx = i;
+                      LinearLayout it = new LinearLayout(this);
+                      it.setOrientation(LinearLayout.VERTICAL);
+                      it.setGravity(Gravity.CENTER_HORIZONTAL);
+                      it.setPadding(0, dp(6), 0, dp(6));
+                      TextView ic = text(20, Ui.DARK, items[i][0]);
+                      ic.setAlpha(i == nav ? 1f : 0.4f);
+                      it.addView(ic);
+                      TextView lb = text(11, i == nav ? Ui.RED : Ui.GRAY, items[i][1]);
+                      it.addView(lb);
+                      it.setOnClickListener(v -> { nav = idx; render(); });
+                      bottom.addView(it, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  }
+              }
+
+              private TextView amountCol(double v, int color) {
+                  TextView t = text(13, color, v > 0 ? Util.money(v) : "");
+                  t.setGravity(Gravity.END);
+                  t.setLayoutParams(new LinearLayout.LayoutParams(dp(96), WRAP));
+                  return t;
+              }
+
+              private void renderDaily(List<Db.Tx> list) {
+                  if (list.isEmpty()) { note("\nเดือนนี้ยังไม่มีรายการ\nกด + เพื่อเพิ่ม"); return; }
+                  SimpleDateFormat key = new SimpleDateFormat("yyyyMMdd", Locale.US);
+                  SimpleDateFormat wk = new SimpleDateFormat("EEE", TH);
+                  SimpleDateFormat my = new SimpleDateFormat("MM.yyyy", Locale.US);
+                  SimpleDateFormat hm = new SimpleDateFormat("HH:mm", Locale.US);
+                  LinkedHashMap<String, List<Db.Tx>> groups = new LinkedHashMap<>();
+                  for (Db.Tx t : list) groups.computeIfAbsent(key.format(new Date(t.ts)), k -> new ArrayList<>()).add(t);
+                  for (List<Db.Tx> day : groups.values()) {
+                      Calendar c = Calendar.getInstance();
+                      c.setTimeInMillis(day.get(0).ts);
+                      double inc = 0, exp = 0;
+                      for (Db.Tx t : day) { if (t.type == 1) inc += t.amount; else if (t.type == 0) exp += t.amount; }
+                      LinearLayout card = card();
+                      LinearLayout h = new LinearLayout(this);
+                      h.setGravity(Gravity.CENTER_VERTICAL);
+                      h.setPadding(dp(14), dp(10), dp(14), dp(10));
+                      TextView dn = text(22, Ui.DARK, String.valueOf(c.get(Calendar.DAY_OF_MONTH)));
+                      dn.setTypeface(null, Typeface.BOLD);
+                      h.addView(dn);
+                      int dow = c.get(Calendar.DAY_OF_WEEK);
+                      TextView chip = text(11, Color.WHITE, wk.format(c.getTime()));
+                      chip.setPadding(dp(6), dp(1), dp(6), dp(1));
+                      chip.setBackground(Ui.round(dow == Calendar.SUNDAY ? Ui.RED : dow == Calendar.SATURDAY ? Ui.BLUE : Ui.GRAY, dp(4), 0, 0));
+                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                      cp.setMargins(dp(8), 0, dp(6), 0);
+                      h.addView(chip, cp);
+                      h.addView(text(12, Ui.GRAY, my.format(c.getTime())), new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      h.addView(amountCol(inc, Ui.BLUE));
+                      h.addView(amountCol(exp, Ui.RED));
+                      card.addView(h);
+                      card.addView(Ui.line(this));
+                      for (Db.Tx t : day) card.addView(txRow(t, hm));
+                  }
+              }
+
+              private View txRow(Db.Tx t, SimpleDateFormat hm) {
+                  LinearLayout r = new LinearLayout(this);
+                  r.setGravity(Gravity.CENTER_VERTICAL);
+                  r.setPadding(dp(14), dp(10), dp(14), dp(10));
+                  String c = t.type == 2 ? "⇄ โอน" : t.type == 3 ? "ปรับยอด"
+                      : !t.category.isEmpty() ? t.category : (t.needAi || t.needCat ? "🤖 รอ AI" : "-");
+                  r.addView(Ui.one(text(13, Ui.GRAY, c)), new LinearLayout.LayoutParams(dp(92), WRAP));
+                  LinearLayout mid = new LinearLayout(this);
+                  mid.setOrientation(LinearLayout.VERTICAL);
+                  mid.addView(Ui.one(text(15, Ui.DARK, t.type == 2 ? t.account + " → " + t.toAccount : t.note.isEmpty() ? c : t.note)));
+                  boolean check = "slip".equals(t.source) && (t.needAi || t.amount == 0);
+                  mid.addView(Ui.one(text(12, Ui.GRAY, (t.type == 2 ? "ไม่นับในรายรับ/รายจ่าย" : t.account) + "   " + hm.format(new Date(t.ts))
+                      + (t.photo.isEmpty() ? "" : "   📷") + (check ? "   ⚠️ตรวจยอด" : ""))));
+                  r.addView(mid, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  TextView a = text(15, t.type == 1 ? Ui.BLUE : t.type == 0 ? Ui.RED : Ui.GRAY, Util.money(t.amount));
+                  a.setPadding(dp(8), 0, 0, 0);
+                  r.addView(a);
+                  final long id = t.id;
+                  r.setOnClickListener(v -> openEdit(id, 0));
+                  return r;
+              }
+
+              private void renderCalendar(List<Db.Tx> list) {
+                  int days = month.getActualMaximum(Calendar.DAY_OF_MONTH);
+                  double[] in = new double[days + 2], ex = new double[days + 2];
+                  Calendar c = Calendar.getInstance();
                   for (Db.Tx t : list) {
-                      String c = t.category.isEmpty() ? "ไม่มีหมวด" : t.category;
-                      if (t.type == 0) {
-                          exp += t.amount;
-                          byCat.merge(c, t.amount, Double::sum);
-                          byAcc.merge(t.account, t.amount, Double::sum);
-                      } else {
-                          inc += t.amount;
-                          byInc.merge(c, t.amount, Double::sum);
-                      }
+                      c.setTimeInMillis(t.ts);
+                      int d = c.get(Calendar.DAY_OF_MONTH);
+                      if (t.type == 1) in[d] += t.amount; else if (t.type == 0) ex[d] += t.amount;
                   }
-                  section("รายจ่ายตามหมวด", byCat, exp, Color.rgb(211, 47, 47));
-                  section("รายจ่ายตามบัญชี", byAcc, exp, Color.rgb(211, 47, 47));
-                  section("รายรับ", byInc, inc, Color.rgb(25, 118, 210));
+                  LinearLayout box = card();
+                  String[] wd = { "อา", "จ", "อ", "พ", "พฤ", "ศ", "ส" };
+                  LinearLayout hr = new LinearLayout(this);
+                  for (int i = 0; i < 7; i++) {
+                      TextView w = text(12, i == 0 ? Ui.RED : i == 6 ? Ui.BLUE : Ui.GRAY, wd[i]);
+                      w.setGravity(Gravity.CENTER);
+                      w.setPadding(0, dp(6), 0, dp(6));
+                      hr.addView(w, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  }
+                  box.addView(hr);
+                  int first = month.get(Calendar.DAY_OF_WEEK) - 1;
+                  int cells = ((first + days + 6) / 7) * 7;
+                  Calendar today = Calendar.getInstance();
+                  boolean thisMonth = today.get(Calendar.YEAR) == month.get(Calendar.YEAR)
+                      && today.get(Calendar.MONTH) == month.get(Calendar.MONTH);
+                  LinearLayout row = null;
+                  for (int i = 0; i < cells; i++) {
+                      if (i % 7 == 0) { row = new LinearLayout(this); box.addView(row); }
+                      LinearLayout cell = new LinearLayout(this);
+                      cell.setOrientation(LinearLayout.VERTICAL);
+                      cell.setPadding(dp(3), dp(3), dp(3), dp(3));
+                      int d = i - first + 1;
+                      boolean isToday = thisMonth && d == today.get(Calendar.DAY_OF_MONTH);
+                      cell.setBackground(Ui.round(isToday ? Color.rgb(255, 236, 236) : Color.WHITE, 0, Ui.LINE, 1));
+                      if (d >= 1 && d <= days) {
+                          int col = i % 7;
+                          cell.addView(text(12, col == 0 ? Ui.RED : col == 6 ? Ui.BLUE : Ui.DARK, String.valueOf(d)));
+                          if (in[d] > 0) cell.addView(Ui.one(text(10, Ui.BLUE, shortMoney(in[d]))));
+                          if (ex[d] > 0) cell.addView(Ui.one(text(10, Ui.RED, shortMoney(ex[d]))));
+                          final int day = d;
+                          cell.setOnClickListener(v -> {
+                              Calendar s = (Calendar) month.clone();
+                              Calendar now = Calendar.getInstance();
+                              s.set(Calendar.DAY_OF_MONTH, day);
+                              s.set(Calendar.HOUR_OF_DAY, now.get(Calendar.HOUR_OF_DAY));
+                              s.set(Calendar.MINUTE, now.get(Calendar.MINUTE));
+                              openEdit(0, s.getTimeInMillis());
+                          });
+                      }
+                      row.addView(cell, new LinearLayout.LayoutParams(0, dp(62), 1f));
+                  }
+                  note("แตะวันที่เพื่อเพิ่มรายการในวันนั้น");
               }
 
-              private void section(String title, Map<String, Double> m, double total, int color) {
-                  TextView h = tv(16f, "\n" + title + "  (" + Util.money(total) + ")");
-                  h.setTypeface(null, Typeface.BOLD);
-                  content.addView(h);
-                  if (m.isEmpty()) { content.addView(tv(14f, "-")); return; }
+              private void renderMonthly() {
+                  SimpleDateFormat mf = new SimpleDateFormat("MMMM", TH);
+                  boolean any = false;
+                  for (int m = 11; m >= 0; m--) {
+                      Calendar s = (Calendar) month.clone();
+                      s.set(Calendar.MONTH, m);
+                      List<Db.Tx> l = range(s, Calendar.MONTH);
+                      if (l.isEmpty()) continue;
+                      any = true;
+                      double inc = 0, exp = 0;
+                      for (Db.Tx t : l) { if (t.type == 1) inc += t.amount; else if (t.type == 0) exp += t.amount; }
+                      LinearLayout card = card();
+                      LinearLayout r = new LinearLayout(this);
+                      r.setGravity(Gravity.CENTER_VERTICAL);
+                      r.setPadding(dp(16), dp(14), dp(16), dp(14));
+                      TextView mn = text(16, Ui.DARK, mf.format(s.getTime()));
+                      mn.setTypeface(null, Typeface.BOLD);
+                      r.addView(mn, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      LinearLayout col = new LinearLayout(this);
+                      col.setOrientation(LinearLayout.VERTICAL);
+                      col.setGravity(Gravity.END);
+                      col.addView(text(13, Ui.BLUE, Util.money(inc)));
+                      col.addView(text(13, Ui.RED, Util.money(exp)));
+                      col.addView(text(12, Ui.GRAY, "รวม " + Util.money(inc - exp)));
+                      r.addView(col);
+                      final int mm = m;
+                      r.setOnClickListener(v -> { month.set(Calendar.MONTH, mm); sub = 0; render(); });
+                      card.addView(r);
+                  }
+                  if (!any) note("\nปีนี้ยังไม่มีรายการ");
+              }
+
+              private void renderStats(List<Db.Tx> list) {
+                  int type = statType == 0 ? 0 : 1;
+                  Map<String, Double> m = new HashMap<>();
+                  Map<String, List<Db.Tx>> items = new HashMap<>();
+                  double total = 0;
+                  for (Db.Tx t : list) {
+                      if (t.type != type) continue;
+                      String c = t.category.isEmpty() ? "ไม่มีหมวด" : t.category;
+                      m.merge(c, t.amount, Double::sum);
+                      items.computeIfAbsent(c, k -> new ArrayList<>()).add(t);
+                      total += t.amount;
+                  }
+                  if (m.isEmpty() || total <= 0) { note("\nเดือนนี้ยังไม่มี" + (type == 0 ? "รายจ่าย" : "รายรับ")); return; }
                   List<Map.Entry<String, Double>> l = new ArrayList<>(m.entrySet());
                   l.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
-                  double max = l.get(0).getValue();
-                  for (Map.Entry<String, Double> en : l) {
-                      int bars = max <= 0 ? 0 : (int) Math.round(en.getValue() / max * 18);
-                      StringBuilder sb = new StringBuilder();
-                      for (int i = 0; i < Math.max(bars, 1); i++) sb.append('█');
-                      int pct = total <= 0 ? 0 : (int) Math.round(en.getValue() * 100 / total);
-                      TextView a = tv(14f, en.getKey() + "   " + Util.money(en.getValue()) + "  (" + pct + "%)");
-                      a.setPadding(0, 10, 0, 0);
-                      content.addView(a);
-                      TextView bar = tv(10f, sb.toString());
-                      bar.setTextColor(color);
-                      content.addView(bar);
+
+                  LinearLayout top = card();
+                  top.setPadding(dp(16), dp(16), dp(16), dp(16));
+                  top.addView(text(13, Ui.GRAY, type == 0 ? "รายจ่ายรวม" : "รายรับรวม"));
+                  TextView tv = text(26, type == 0 ? Ui.RED : Ui.BLUE, Util.money(total));
+                  tv.setTypeface(null, Typeface.BOLD);
+                  top.addView(tv);
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setBackground(Ui.round(Ui.LINE, dp(8), 0, 0));
+                  bar.setClipToOutline(true);
+                  for (int i = 0; i < l.size(); i++) {
+                      View seg = new View(this);
+                      seg.setBackgroundColor(PALETTE[i % PALETTE.length]);
+                      bar.addView(seg, new LinearLayout.LayoutParams(0, MATCH, (float) (l.get(i).getValue() / total)));
                   }
+                  LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(MATCH, dp(16));
+                  bl.setMargins(0, dp(12), 0, 0);
+                  top.addView(bar, bl);
+
+                  LinearLayout lc = card();
+                  for (int i = 0; i < l.size(); i++) {
+                      Map.Entry<String, Double> en = l.get(i);
+                      LinearLayout r = new LinearLayout(this);
+                      r.setGravity(Gravity.CENTER_VERTICAL);
+                      r.setPadding(dp(14), dp(12), dp(14), dp(12));
+                      int pct = (int) Math.round(en.getValue() * 100 / total);
+                      TextView b = text(12, Color.WHITE, pct + "%");
+                      b.setGravity(Gravity.CENTER);
+                      b.setBackground(Ui.round(PALETTE[i % PALETTE.length], dp(4), 0, 0));
+                      r.addView(b, new LinearLayout.LayoutParams(dp(48), dp(24)));
+                      TextView n = Ui.one(text(15, Ui.DARK, en.getKey()));
+                      n.setPadding(dp(12), 0, dp(8), 0);
+                      r.addView(n, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      r.addView(text(15, Ui.DARK, Util.money(en.getValue())));
+                      final String name = en.getKey();
+                      final List<Db.Tx> its = items.get(name);
+                      r.setOnClickListener(v -> showCategory(name, its));
+                      lc.addView(r);
+                      if (i < l.size() - 1) lc.addView(Ui.line(this));
+                  }
+              }
+
+              private void showCategory(String name, List<Db.Tx> its) {
+                  SimpleDateFormat f = new SimpleDateFormat("dd/MM HH:mm", Locale.US);
+                  String[] rows = new String[its.size()];
+                  for (int i = 0; i < its.size(); i++) {
+                      Db.Tx t = its.get(i);
+                      rows[i] = f.format(new Date(t.ts)) + "   " + Util.money(t.amount) + "   " + Util.cut(t.note.isEmpty() ? t.account : t.note, 22);
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle(name)
+                      .setItems(rows, (d, w) -> openEdit(its.get(w).id, 0))
+                      .setPositiveButton("ปิด", null)
+                      .show();
+              }
+
+              private LinearLayout sumCell(String label, double v, int color) {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setGravity(Gravity.CENTER_HORIZONTAL);
+                  box.addView(text(12, Ui.GRAY, label));
+                  TextView t = text(15, color, Util.money(v));
+                  t.setTypeface(null, Typeface.BOLD);
+                  box.addView(t);
+                  box.setLayoutParams(new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  return box;
+              }
+
+              private void renderAccounts() {
+                  Db db = Db.get(this);
+                  LinkedHashMap<String, Double> bal = new LinkedHashMap<>();
+                  for (String a : db.accounts()) bal.put(a, 0.0);
+                  for (Db.Tx t : db.query(null, null, null)) {
+                      String a = t.account.isEmpty() ? "ไม่ระบุบัญชี" : t.account;
+                      if (t.type == 2) {
+                          bal.merge(a, -t.amount, Double::sum);
+                          bal.merge(t.toAccount.isEmpty() ? "ไม่ระบุบัญชี" : t.toAccount, t.amount, Double::sum);
+                      } else {
+                          bal.merge(a, t.type == 1 || t.type == 3 ? t.amount : -t.amount, Double::sum);
+                      }
+                  }
+                  double plus = 0, minus = 0;
+                  for (double v : bal.values()) { if (v >= 0) plus += v; else minus += v; }
+                  LinearLayout top = card();
+                  LinearLayout r0 = new LinearLayout(this);
+                  r0.setPadding(0, dp(12), 0, dp(12));
+                  r0.addView(sumCell("สินทรัพย์", plus, Ui.BLUE));
+                  r0.addView(sumCell("หนี้สิน", -minus, Ui.RED));
+                  r0.addView(sumCell("รวม", plus + minus, Ui.DARK));
+                  top.addView(r0);
+
+                  LinearLayout lc = card();
+                  int i = 0;
+                  for (Map.Entry<String, Double> e : bal.entrySet()) {
+                      LinearLayout r = new LinearLayout(this);
+                      r.setGravity(Gravity.CENTER_VERTICAL);
+                      r.setPadding(dp(16), dp(14), dp(16), dp(14));
+                      r.addView(Ui.one(text(15, Ui.DARK, e.getKey())), new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      r.addView(text(15, e.getValue() >= 0 ? Ui.BLUE : Ui.RED, Util.money(e.getValue())));
+                      final String an = e.getKey();
+                      final double cur = e.getValue();
+                      r.setOnClickListener(v -> adjustBalance(an, cur));
+                      lc.addView(r);
+                      if (++i < bal.size()) lc.addView(Ui.line(this));
+                  }
+                  note("แตะบัญชีเพื่อใส่ยอดจริงจากธนาคาร แอปจะปรับยอดให้ตรง (ไม่นับเป็นรายรับ/รายจ่าย)");
+              }
+
+              private void adjustBalance(String acc, double cur) {
+                  android.widget.EditText e = new android.widget.EditText(this);
+                  e.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED);
+                  e.setHint(String.format(Locale.US, "%.2f", cur));
+                  new AlertDialog.Builder(this)
+                      .setTitle(acc + " : ยอดจริงตอนนี้")
+                      .setMessage("ยอดในแอป " + Util.money(cur) + " บาท\nใส่ยอดคงเหลือจริงจากแอปธนาคาร")
+                      .setView(e)
+                      .setPositiveButton("ปรับยอด", (d, w) -> {
+                          double real;
+                          try { real = Double.parseDouble(e.getText().toString().replace(",", "").trim()); }
+                          catch (Exception ex) { return; }
+                          double diff = Math.round((real - cur) * 100) / 100.0;
+                          if (Math.abs(diff) < 0.005) { toast("ยอดตรงอยู่แล้ว"); return; }
+                          Db.Tx t = new Db.Tx();
+                          t.ts = System.currentTimeMillis(); t.type = 3; t.amount = diff;
+                          t.account = acc; t.note = "ปรับยอดให้ตรงกับธนาคาร"; t.source = "adjust";
+                          Db.get(this).insert(t);
+                          toast("ปรับยอด " + acc + " เป็น " + Util.money(real) + " แล้ว");
+                          render();
+                      })
+                      .setNegativeButton("ยกเลิก", null)
+                      .show();
               }
 
               private void renderSettings() {
-                  content.addView(tv(15f, "\nอ่านแจ้งเตือนธนาคาร: " + (listenerEnabled() ? "✅" : "❌ (กดปุ่ม 1)")
+                  LinearLayout c = card();
+                  c.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  c.addView(text(15, Ui.DARK, "อ่านแจ้งเตือนธนาคาร: " + (listenerEnabled() ? "✅" : "❌ (กดปุ่ม 1)")
                       + "\nเก็บรูปสลิปอัตโนมัติ: " + (imagesAllowed() ? "✅" : "❌ (กดปุ่ม 2)")
                       + "\nAI ในเครื่อง: " + (aiStatus == -2 ? "กำลังตรวจ..." : Ai.statusText(aiStatus))));
-
-                  content.addView(btn("1. เปิดสิทธิ์อ่านการแจ้งเตือน", v ->
+                  c.addView(btn("1. เปิดสิทธิ์อ่านการแจ้งเตือน", v ->
                       startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))));
-                  content.addView(btn("2. อนุญาตแจ้งเตือน + รูปภาพ", v -> {
+                  c.addView(btn("2. อนุญาตแจ้งเตือน + รูปภาพ", v -> {
                       if (Build.VERSION.SDK_INT >= 33) {
                           requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.READ_MEDIA_IMAGES }, 1);
                       } else {
                           requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE }, 1);
                       }
                   }));
-                  content.addView(btn("3. เชื่อมต่อบริการใหม่", v -> {
+                  c.addView(btn("3. เชื่อมต่อบริการใหม่", v -> {
                       NotificationListenerService.requestRebind(new ComponentName(this, BankNotificationService.class));
                       toast("ส่งคำขอเชื่อมต่อใหม่แล้ว");
                   }));
-                  content.addView(btn("4. ตรวจ / ดาวน์โหลด AI ในเครื่อง", v -> setupAi()));
+                  c.addView(btn("4. ตรวจ / ดาวน์โหลด AI ในเครื่อง", v -> setupAi()));
 
-                  content.addView(tv(16f, "\nข้อมูล"));
-                  content.addView(btn("📥 นำเข้าจาก Money Manager (.mmbak)", v -> {
+                  LinearLayout d2 = card();
+                  d2.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  d2.addView(text(15, Ui.DARK, "ข้อมูล"));
+                  d2.addView(btn("📥 นำเข้าจาก Money Manager (.mmbak)", v -> {
                       Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                       i.addCategory(Intent.CATEGORY_OPENABLE);
                       i.setType("*/*");
                       startActivityForResult(i, REQ_IMPORT);
                   }));
-                  content.addView(btn("💾 สำรองข้อมูล + รูป (ไปที่ Download/AutoBook)", v -> backup()));
-                  content.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
+                  d2.addView(btn("💾 สำรองข้อมูล + รูป (ไปที่ Download/AutoBook)", v -> backup()));
+                  d2.addView(btn("♻️ กู้คืนจากไฟล์สำรอง (.zip)", v -> new AlertDialog.Builder(this)
                       .setMessage("ข้อมูลปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรอง ดำเนินการต่อ?")
-                      .setPositiveButton("กู้คืน", (d, w) -> {
+                      .setPositiveButton("กู้คืน", (dd, w) -> {
                           Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                           i.addCategory(Intent.CATEGORY_OPENABLE);
                           i.setType("*/*");
@@ -1473,7 +2004,7 @@ jobs:
                       })
                       .setNegativeButton("ยกเลิก", null)
                       .show()));
-                  content.addView(btn("ทดสอบ: เพิ่มรายจ่าย 150.00 (กรุงไทย)", v -> {
+                  d2.addView(btn("ทดสอบ: เพิ่มรายจ่าย 150.00 (กรุงไทย)", v -> {
                       Db.Tx t = new Db.Tx();
                       t.ts = System.currentTimeMillis(); t.amount = 150; t.account = "กรุงไทย";
                       t.note = "7-Eleven ทดสอบ"; t.source = "test"; t.needCat = true;
@@ -1484,9 +2015,9 @@ jobs:
                   }));
 
                   String d = Util.debugLog(this);
-                  TextView dbg = tv(11f, "\n=== debug ===\n" + (d.isEmpty() ? "(ยังไม่มี)" : d));
-                  dbg.setTextColor(Color.GRAY);
+                  TextView dbg = text(11, Ui.GRAY, "=== debug ===\n" + (d.isEmpty() ? "(ยังไม่มี)" : d));
                   dbg.setTextIsSelectable(true);
+                  dbg.setPadding(dp(16), dp(12), dp(16), dp(12));
                   content.addView(dbg);
               }
 
