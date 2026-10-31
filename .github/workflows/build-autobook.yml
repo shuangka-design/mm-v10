@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.6.1 auto backup)
+name: Build AutoBook APK (v3.7 simple categories)
 
 on:
   push:
@@ -63,8 +63,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 9
-                  versionName = "3.6.1"
+                  versionCode = 10
+                  versionName = "3.7"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -146,7 +146,7 @@ jobs:
               }
 
               private Db(Context c) {
-                  super(c, "book.db", null, 2);
+                  super(c, "book.db", null, 3);
                   setWriteAheadLoggingEnabled(false); // single file -> easy backup
               }
 
@@ -165,14 +165,13 @@ jobs:
                       v.put("name", accs[i]); v.put("ord", i);
                       d.insert("acc", null, v);
                   }
-                  String[] ex = { "🍜 Food", "Lunch", "Dinner", "กาแฟ", "SHOPPEE", "TRUE MONEY", "น้ำมัน",
-                      "ทำงาน", "🪑 Household", "Schooling", "Other" };
+                  String[] ex = Cats.EXPENSE;
                   for (int i = 0; i < ex.length; i++) {
                       ContentValues v = new ContentValues();
                       v.put("name", ex[i]); v.put("type", 0); v.put("ord", i);
                       d.insert("cat", null, v);
                   }
-                  String[] in = { "เงินเดือน", "Other" };
+                  String[] in = Cats.INCOME;
                   for (int i = 0; i < in.length; i++) {
                       ContentValues v = new ContentValues();
                       v.put("name", in[i]); v.put("type", 1); v.put("ord", i);
@@ -183,6 +182,44 @@ jobs:
               @Override
               public void onUpgrade(SQLiteDatabase d, int o, int n) {
                   if (o < 2) d.execSQL("ALTER TABLE tx ADD COLUMN to_account TEXT DEFAULT ''");
+                  if (o < 3) simplifyCategories(d);
+              }
+
+              /** v3.7: 37 old categories -> 11, family names -> note, TRUE MONEY top-ups -> transfers */
+              private static void simplifyCategories(SQLiteDatabase d) {
+                  d.beginTransaction();
+                  try {
+                      // TRUE MONEY top-up = transfer into the TrueMoney wallet
+                      d.execSQL("INSERT OR IGNORE INTO acc (name, ord) VALUES (?, (SELECT COUNT(*) FROM acc))",
+                          new Object[] { Cats.TRUEMONEY_ACC });
+                      d.execSQL("UPDATE tx SET type = 2, to_account = ?, category = '', need_cat = 0, need_ai = 0, "
+                          + "note = CASE WHEN IFNULL(note, '') = '' THEN 'เติม TrueMoney' ELSE note END "
+                          + "WHERE type = 0 AND category = ? AND account <> ?",
+                          new Object[] { Cats.TRUEMONEY_ACC, Cats.TRUEMONEY_CAT, Cats.TRUEMONEY_ACC });
+                      d.execSQL("UPDATE tx SET category = ? WHERE type = 0 AND category = ?",
+                          new Object[] { "อื่นๆ", Cats.TRUEMONEY_CAT });
+                      // family member -> note
+                      for (String p : Cats.PEOPLE) {
+                          d.execSQL("UPDATE tx SET note = CASE WHEN IFNULL(note, '') = '' THEN ? ELSE ? || ' · ' || note END "
+                              + "WHERE type = 0 AND category = ?", new Object[] { p, p, p });
+                      }
+                      for (java.util.Map.Entry<String, String> e : Cats.MAP.entrySet()) {
+                          d.execSQL("UPDATE tx SET category = ? WHERE category = ?", new Object[] { e.getValue(), e.getKey() });
+                          d.execSQL("UPDATE shopcat SET category = ? WHERE category = ?", new Object[] { e.getValue(), e.getKey() });
+                      }
+                      d.execSQL("DELETE FROM shopcat WHERE category = ?", new Object[] { Cats.TRUEMONEY_CAT });
+                      d.execSQL("DELETE FROM cat");
+                      for (int i = 0; i < Cats.EXPENSE.length; i++)
+                          d.execSQL("INSERT OR IGNORE INTO cat (name, type, ord) VALUES (?, 0, ?)", new Object[] { Cats.EXPENSE[i], i });
+                      for (int i = 0; i < Cats.INCOME.length; i++)
+                          d.execSQL("INSERT OR IGNORE INTO cat (name, type, ord) VALUES (?, 1, ?)", new Object[] { Cats.INCOME[i], i });
+                      // anything left with an unknown category keeps it and stays selectable
+                      d.execSQL("INSERT OR IGNORE INTO cat (name, type, ord) SELECT DISTINCT category, type, 99 FROM tx "
+                          + "WHERE type IN (0, 1) AND IFNULL(category, '') <> ''");
+                      d.setTransactionSuccessful();
+                  } finally {
+                      d.endTransaction();
+                  }
               }
 
               private static String s(String x) { return x == null ? "" : x; }
@@ -323,6 +360,84 @@ jobs:
                   if (shop == null || shop.isEmpty()) return null;
                   List<String> l = names("SELECT category FROM shopcat WHERE shop=?", new String[] { shop });
                   return l.isEmpty() ? null : l.get(0);
+              }
+          }
+          EOF
+          cat > $J/Cats.java << 'EOF'
+          package com.example.autobook;
+
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+
+          /** simplified expense categories (v3.7) */
+          public final class Cats {
+              private Cats() { }
+
+              public static final String[] EXPENSE = { "🍜 อาหาร", "🏠 บ้านและค่าบริการ", "🚗 รถและเดินทาง", "🛍 ช้อปปิ้ง", "👨‍👩‍👧 ครอบครัว", "📚 การศึกษา", "💼 งาน", "🙏 ทำบุญและของขวัญ", "🎉 พักผ่อนและบันเทิง", "💰 ออม", "อื่นๆ" };
+              public static final String[] INCOME = { "💰 Salary", "อื่นๆ" };
+              public static final String FAMILY = "👨‍👩‍👧 ครอบครัว";
+              public static final String TRUEMONEY_CAT = "TRUE MONEY";
+              public static final String TRUEMONEY_ACC = "TrueMoney";
+
+              private static final String[] PAIRS = {
+                  "🍜 Food", "🍜 อาหาร",
+                  "Dinner", "🍜 อาหาร",
+                  "Lunch", "🍜 อาหาร",
+                  "กาแฟ", "🍜 อาหาร",
+                  "Beverages", "🍜 อาหาร",
+                  "Eating out", "🍜 อาหาร",
+                  "🪑 Household", "🏠 บ้านและค่าบริการ",
+                  "ค่าไฟ", "🏠 บ้านและค่าบริการ",
+                  "ค่าน้ำ", "🏠 บ้านและค่าบริการ",
+                  "ค่าโทรศัพท์", "🏠 บ้านและค่าบริการ",
+                  "AIS FIBRE", "🏠 บ้านและค่าบริการ",
+                  "ค่าส่วนกลาง", "🏠 บ้านและค่าบริการ",
+                  "Appliances", "🏠 บ้านและค่าบริการ",
+                  "Furniture", "🏠 บ้านและค่าบริการ",
+                  "น้ำมัน", "🚗 รถและเดินทาง",
+                  "Car", "🚗 รถและเดินทาง",
+                  "🚖 Transport", "🚗 รถและเดินทาง",
+                  "SHOPPEE", "🛍 ช้อปปิ้ง",
+                  "Clothing", "🛍 ช้อปปิ้ง",
+                  "Shoes", "🛍 ช้อปปิ้ง",
+                  "Fashion", "🛍 ช้อปปิ้ง",
+                  "แม่", "👨‍👩‍👧 ครอบครัว",
+                  "พ่อ", "👨‍👩‍👧 ครอบครัว",
+                  "ซัน", "👨‍👩‍👧 ครอบครัว",
+                  "อ้อน", "👨‍👩‍👧 ครอบครัว",
+                  "Schooling", "📚 การศึกษา",
+                  "📙 Education", "📚 การศึกษา",
+                  "Academy", "📚 การศึกษา",
+                  "ทำงาน", "💼 งาน",
+                  "สร้างบุญ", "🙏 ทำบุญและของขวัญ",
+                  "🎁 Gift", "🙏 ทำบุญและของขวัญ",
+                  "Hotel", "🎉 พักผ่อนและบันเทิง",
+                  "Music", "🎉 พักผ่อนและบันเทิง",
+                  "Apps", "🎉 พักผ่อนและบันเทิง",
+                  "สลากออมสิน", "💰 ออม",
+                  "Other", "อื่นๆ",
+                  "เงินเดือน", "💰 Salary"
+              };
+              public static final Map<String, String> MAP = new HashMap<>();
+              public static final Set<String> PEOPLE = new HashSet<>();
+              static {
+                  for (int i = 0; i < PAIRS.length; i += 2) MAP.put(PAIRS[i], PAIRS[i + 1]);
+                  PEOPLE.add("แม่"); PEOPLE.add("พ่อ"); PEOPLE.add("ซัน"); PEOPLE.add("อ้อน");
+              }
+
+              /** new category for an old name (unchanged if unknown) */
+              public static String map(String old) {
+                  if (old == null) return "";
+                  String n = MAP.get(old.trim());
+                  return n == null ? old.trim() : n;
+              }
+
+              /** family members move into the note: "แม่ · ค่ายา" */
+              public static String note(String oldCat, String note) {
+                  if (oldCat == null || !PEOPLE.contains(oldCat.trim())) return note;
+                  return note == null || note.isEmpty() ? oldCat.trim() : oldCat.trim() + " · " + note;
               }
           }
           EOF
@@ -1071,7 +1186,19 @@ jobs:
                                   t.note = "ปรับยอด" + (t.note.isEmpty() ? "" : " (" + t.note + ")");
                               } else {
                                   t.type = mt == 1 ? 0 : 1;
-                                  t.category = s(cur.getString(5));
+                                  String old = s(cur.getString(5));
+                                  if (t.type == 0 && Cats.TRUEMONEY_CAT.equals(old.trim())
+                                          && !Cats.TRUEMONEY_ACC.equals(t.account)) {
+                                      // top-up of my own wallet -> transfer, not an expense
+                                      t.type = 2;
+                                      t.toAccount = Cats.TRUEMONEY_ACC;
+                                      if (t.note.isEmpty()) t.note = "เติม TrueMoney";
+                                      db.addAccount(Cats.TRUEMONEY_ACC);
+                                      tr++;
+                                  } else {
+                                      t.category = Cats.map(old);
+                                      if (t.type == 0) t.note = Cats.note(old, t.note);
+                                  }
                               }
                               db.insert(t);
                               db.addAccount(t.account);
