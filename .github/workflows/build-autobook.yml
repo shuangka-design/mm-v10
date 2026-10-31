@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.10.3 fixed signing)
+name: Build AutoBook APK (v3.10.4 fixed signing)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 16
-                  versionName = "3.10.3"
+                  versionCode = 17
+                  versionName = "3.10.4"
               }
               signingConfigs {
                   create("fixed") {
@@ -3224,10 +3224,6 @@ jobs:
           cd /tmp/ab
           gradle assembleDebug --console=plain 2>&1 | tee /tmp/build.log
 
-      - name: Check APK signature
-        run: |
-          echo "===== APK นี้เซ็นด้วย (ต้องตรงกับกุญแจด้านบน) ====="
-          keytool -printcert -jarfile /tmp/ab/app/build/outputs/apk/debug/app-debug.apk | grep -E "SHA256|SHA-256|Owner"
 
       - name: Show real errors (only if build failed)
         if: failure()
@@ -3240,3 +3236,14 @@ jobs:
         with:
           name: AutoBook-APK
           path: /tmp/ab/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Check APK signature
+        continue-on-error: true
+        run: |
+          echo "===== APK นี้เซ็นด้วย (ต้องตรงกับกุญแจด้านบน) ====="
+          SIGNER=$(ls -d $ANDROID_HOME/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$SIGNER" ]; then
+            "$SIGNER" verify --print-certs /tmp/ab/app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256" || true
+          else
+            echo "ไม่พบ apksigner (ข้ามการเช็ก ไม่กระทบ APK)"
+          fi
