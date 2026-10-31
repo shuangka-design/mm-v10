@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.10.2 export fix)
+name: Build AutoBook APK (v3.10.3 fixed signing)
 
 on:
   push:
@@ -69,8 +69,19 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 15
-                  versionName = "3.10.2"
+                  versionCode = 16
+                  versionName = "3.10.3"
+              }
+              signingConfigs {
+                  create("fixed") {
+                      storeFile = file(System.getenv("AB_KEYSTORE") ?: "/missing.keystore")
+                      storePassword = "android"
+                      keyAlias = "androiddebugkey"
+                      keyPassword = "android"
+                  }
+              }
+              buildTypes {
+                  getByName("debug") { signingConfig = signingConfigs.getByName("fixed") }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -3200,16 +3211,23 @@ jobs:
             git config user.email "41898315+github-actions[bot]@users.noreply.github.com"
             git add signing/autobook-debug.keystore
             git commit -m "Add fixed signing key [skip ci]"
-            git push
+            git push || { echo "::error::บันทึกกุญแจเข้า repo ไม่ได้ -> Settings > Actions > General > Workflow permissions = Read and write"; exit 1; }
           fi
           cp signing/autobook-debug.keystore ~/.android/debug.keystore
-          keytool -list -keystore ~/.android/debug.keystore -storepass android | grep -i "fingerprint" || true
+          echo "AB_KEYSTORE=$GITHUB_WORKSPACE/signing/autobook-debug.keystore" >> $GITHUB_ENV
+          echo "===== กุญแจที่ใช้ (SHA-256 ต้องเหมือนกันทุก Build) ====="
+          keytool -list -v -keystore signing/autobook-debug.keystore -storepass android | grep -E "SHA256|SHA-256"
 
       - name: Build APK
         run: |
           set -o pipefail
           cd /tmp/ab
           gradle assembleDebug --console=plain 2>&1 | tee /tmp/build.log
+
+      - name: Check APK signature
+        run: |
+          echo "===== APK นี้เซ็นด้วย (ต้องตรงกับกุญแจด้านบน) ====="
+          keytool -printcert -jarfile /tmp/ab/app/build/outputs/apk/debug/app-debug.apk | grep -E "SHA256|SHA-256|Owner"
 
       - name: Show real errors (only if build failed)
         if: failure()
