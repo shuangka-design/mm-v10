@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.10.1 export fix)
+name: Build AutoBook APK (v3.10.2 export fix)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 14
-                  versionName = "3.10.1"
+                  versionCode = 15
+                  versionName = "3.10.2"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -1368,7 +1368,22 @@ jobs:
                   catch (Exception e) { return false; }
               }
 
+              private final Map<String, java.util.Set<String>> pkCols = new HashMap<>();
+
+              /** primary key columns (e.g. INOUTCOME.AID) -> let SQLite assign a new value */
+              private java.util.Set<String> pk(String table) {
+                  java.util.Set<String> r = pkCols.get(table);
+                  if (r != null) return r;
+                  r = new java.util.HashSet<>();
+                  try (Cursor c = d.rawQuery("PRAGMA table_info(" + table + ")", null)) {
+                      while (c.moveToNext()) if (c.getInt(5) > 0) r.add(c.getString(1));
+                  }
+                  pkCols.put(table, r);
+                  return r;
+              }
+
               private void insert(String table, ContentValues v) {
+                  for (String k : pk(table)) v.remove(k);
                   if (v.containsKey("ID")) {
                       Long n = nextId.get(table);
                       if (n == null) {
@@ -1440,6 +1455,22 @@ jobs:
                       if ((K.contains("MONEY") || K.contains("AMOUNT")) && sameNum(tpl.get(k), money)) set(v, k, amount);
                       if (K.contains("DATE") && s(tpl.get(k)).equals(s(date))) set(v, k, ts);
                   }
+                  // text copies of the date (e.g. WDATE "2026-10-31", wtime "18:09") keep the template's format
+                  for (String k : new String[] { "WDATE", "wtime" }) {
+                      String old = s(tpl.get(k));
+                      if (!v.containsKey(k) || old.equals(s(date))) continue;
+                      String f = old.matches("\\d{4}-\\d{2}-\\d{2}") ? "yyyy-MM-dd"
+                          : old.matches("\\d{8}") ? "yyyyMMdd"
+                          : old.matches("\\d{1,2}:\\d{2}:\\d{2}") ? "HH:mm:ss"
+                          : old.matches("\\d{1,2}:\\d{2}") ? "HH:mm" : null;
+                      if (f != null) set(v, k, new java.text.SimpleDateFormat(f, Locale.US).format(new java.util.Date(ts)));
+                  }
+                  set(v, "UTIME", System.currentTimeMillis());
+                  set(v, "txUidTrans", "");
+                  set(v, "txUidFee", "");
+                  set(v, "SMS_ORIGIN", "");
+                  set(v, "SMS_PARSE_CONTENT", "");
+                  set(v, "SMS_RDATE", "");
                   set(v, "ZMONEY", amount);
                   set(v, "ZDATE", ts);
                   set(v, "DO_TYPE", doType);
@@ -1464,7 +1495,8 @@ jobs:
                       if (tIn == null) tIn = tEx;
                       if (tEx == null) throw new RuntimeException("ใน Money Manager ต้องมีรายจ่ายหรือรายรับอย่างน้อย 1 รายการ");
                       if (t3 != null) {
-                          t4 = row("SELECT * FROM INOUTCOME WHERE CAST(DO_TYPE AS INTEGER) = 4 AND ZDATE = ? LIMIT 1", s(t3.get("ZDATE")));
+                          t4 = row("SELECT * FROM INOUTCOME WHERE CAST(DO_TYPE AS INTEGER) = 4 AND (uid = ? OR txUidTrans = ? OR ZDATE = ?) LIMIT 1",
+                              s(t3.get("txUidTrans")), s(t3.get("uid")), s(t3.get("ZDATE")));
                           pairSwap = t4 != null && s(t4.get("assetUid")).equals(s(t3.get("toAssetUid")));
                       }
                       assetTpl = row("SELECT * FROM ASSETS LIMIT 1");
@@ -1500,26 +1532,35 @@ jobs:
                                   set(v, "assetUid", from);
                                   set(v, "ctgUid", category(t.category, ex));
                                   set(v, "toAssetUid", "");
+                                  set(v, "ASSET_NIC", t.account);
+                                  set(v, "CATEGORY_NAME", t.category.isEmpty() ? "อื่นๆ" : t.category);
                                   insert("INOUTCOME", v);
                               } else if (t.type == 2) {
                                   String to = asset(t.toAccount);
                                   ContentValues v = fill(t3 != null ? t3 : tEx, 3, t.ts, t.amount, t.note);
                                   set(v, "assetUid", from);
                                   set(v, "toAssetUid", to);
+                                  set(v, "ASSET_NIC", t.account);
                                   if (t3 == null) set(v, "ctgUid", "");
-                                  insert("INOUTCOME", v);
+                                  ContentValues w = null;
                                   if (t4 != null) {
-                                      ContentValues w = fill(t4, 4, t.ts, t.amount, t.note);
+                                      w = fill(t4, 4, t.ts, t.amount, t.note);
                                       set(w, "assetUid", pairSwap ? to : from);
                                       set(w, "toAssetUid", pairSwap ? from : to);
-                                      insert("INOUTCOME", w);
+                                      set(w, "ASSET_NIC", pairSwap ? t.toAccount : t.account);
+                                      // link the pair the same way the template pair is linked
+                                      if (!s(t3.get("txUidTrans")).isEmpty()) set(v, "txUidTrans", w.getAsString("uid"));
+                                      if (!s(t4.get("txUidTrans")).isEmpty()) set(w, "txUidTrans", v.getAsString("uid"));
                                   }
+                                  insert("INOUTCOME", v);
+                                  if (w != null) insert("INOUTCOME", w);
                               } else if (t.type == 3) {
                                   boolean plus = t.amount > 0;
                                   ContentValues tpl = plus ? (t7 != null ? t7 : tIn) : (t8 != null ? t8 : tEx);
                                   ContentValues v = fill(tpl, plus ? 7 : 8, t.ts, Math.abs(t.amount), t.note);
                                   set(v, "assetUid", from);
                                   set(v, "toAssetUid", "");
+                                  set(v, "ASSET_NIC", t.account);
                                   if (plus ? t7 == null : t8 == null) set(v, "ctgUid", "");
                                   insert("INOUTCOME", v);
                               }
