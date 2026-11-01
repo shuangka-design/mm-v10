@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.10.4 fixed signing)
+name: Build AutoBook APK (v3.11 icons + nicer list)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 17
-                  versionName = "3.10.4"
+                  versionCode = 18
+                  versionName = "3.11"
               }
               signingConfigs {
                   create("fixed") {
@@ -1632,6 +1632,103 @@ jobs:
                   return t;
               }
 
+              // ---------- bank / account badges ----------
+              // { keywords (lower case, | separated), short label, background, text colour }
+              private static final Object[][] BANKS = {
+                  { "กรุงไทย|ktb|krungthai", "KTB", Color.rgb(0, 166, 228), Color.WHITE },
+                  { "กรุงศรี|bay|krungsri", "BAY", Color.rgb(254, 196, 0), Color.rgb(90, 70, 60) },
+                  { "ออมสิน|gsb", "GSB", Color.rgb(235, 25, 141), Color.WHITE },
+                  { "กสิกร|kbank|kbiz|k plus|kplus", "K", Color.rgb(19, 143, 45), Color.WHITE },
+                  { "ไทยพาณิชย์|scb", "SCB", Color.rgb(78, 40, 132), Color.WHITE },
+                  { "กรุงเทพ|bbl|bualuang|bk6", "BBL", Color.rgb(30, 69, 152), Color.WHITE },
+                  { "ทหารไทย|ธนชาต|ttb", "ttb", Color.rgb(0, 86, 164), Color.WHITE },
+                  { "ยูโอบี|uob", "UOB", Color.rgb(0, 51, 102), Color.WHITE },
+                  { "ซีไอเอ็มบี|cimb", "CIMB", Color.rgb(122, 0, 0), Color.WHITE },
+                  { "เกียรตินาคิน|kkp", "KKP", Color.rgb(89, 77, 158), Color.WHITE },
+                  { "ธ.ก.ส|ธกส|baac", "ธกส", Color.rgb(0, 122, 61), Color.WHITE },
+                  { "อาคารสงเคราะห์|ธอส|ghb", "GHB", Color.rgb(247, 136, 0), Color.WHITE },
+                  { "truemoney|true money|ทรูมันนี่", "TM", Color.rgb(255, 105, 0), Color.WHITE },
+                  { "promptpay|พร้อมเพย์", "PP", Color.rgb(16, 56, 104), Color.WHITE },
+                  { "shopee", "S", Color.rgb(238, 77, 45), Color.WHITE },
+                  { "line pay|rabbit", "LINE", Color.rgb(6, 199, 85), Color.WHITE },
+                  { "aat", "AAT", Color.rgb(0, 121, 107), Color.WHITE },
+                  { "cash|เงินสด", "💵", Color.rgb(232, 245, 233), DARK },
+                  { "card|บัตร|credit|visa|master", "💳", Color.rgb(227, 236, 250), DARK },
+              };
+              private static final int[] SOFT = {
+                  Color.rgb(255, 235, 238), Color.rgb(232, 245, 233), Color.rgb(227, 242, 253), Color.rgb(255, 243, 224),
+                  Color.rgb(243, 229, 245), Color.rgb(224, 247, 250), Color.rgb(255, 253, 231), Color.rgb(239, 235, 233) };
+              private static final int[] DEEP = {
+                  Color.rgb(229, 57, 53), Color.rgb(67, 160, 71), Color.rgb(30, 136, 229), Color.rgb(251, 140, 0),
+                  Color.rgb(142, 36, 170), Color.rgb(0, 172, 193), Color.rgb(249, 168, 37), Color.rgb(109, 76, 65) };
+
+              private static int hash(String s) { return (s == null ? 0 : s.hashCode()) & 0x7fffffff; }
+
+              /** round coloured badge for an account: bank colour + short name */
+              public static TextView accountBadge(Context c, String acc, int sizeDp) {
+                  String a = acc == null ? "" : acc.toLowerCase(java.util.Locale.ROOT);
+                  String label = null;
+                  int bg = 0, fg = Color.WHITE;
+                  for (Object[] b : BANKS) {
+                      for (String k : ((String) b[0]).split("\\|")) {
+                          if (!k.isEmpty() && a.contains(k)) { label = (String) b[1]; bg = (Integer) b[2]; fg = (Integer) b[3]; break; }
+                      }
+                      if (label != null) break;
+                  }
+                  if (label == null) {
+                      String t = acc == null || acc.trim().isEmpty() ? "?" : acc.trim();
+                      int cp = t.codePointAt(0);
+                      label = new String(Character.toChars(cp)).toUpperCase(java.util.Locale.ROOT);
+                      bg = DEEP[hash(acc) % DEEP.length];
+                  }
+                  return circle(c, label, bg, fg, sizeDp);
+              }
+
+              /** "🍜 อาหาร" -> "🍜" */
+              public static String catIcon(String cat) {
+                  if (cat == null || cat.trim().isEmpty()) return "•";
+                  String t = cat.trim();
+                  int sp = t.indexOf(' ');
+                  if (sp > 0 && !Character.isLetterOrDigit(t.codePointAt(0))) return t.substring(0, sp);
+                  if (t.equals("อื่นๆ") || t.equalsIgnoreCase("other")) return "📦";
+                  return new String(Character.toChars(t.codePointAt(0))).toUpperCase(java.util.Locale.ROOT);
+              }
+
+              /** "🍜 อาหาร" -> "อาหาร" */
+              public static String catLabel(String cat) {
+                  if (cat == null) return "";
+                  String t = cat.trim();
+                  int sp = t.indexOf(' ');
+                  if (sp > 0 && !Character.isLetterOrDigit(t.codePointAt(0))) return t.substring(sp + 1).trim();
+                  return t;
+              }
+
+              public static TextView catBadge(Context c, String cat, int sizeDp) {
+                  int h = hash(catLabel(cat));
+                  return circle(c, catIcon(cat), SOFT[h % SOFT.length], DEEP[h % DEEP.length], sizeDp);
+              }
+
+              public static TextView circle(Context c, String label, int bg, int fg, int sizeDp) {
+                  TextView t = new TextView(c);
+                  t.setText(label);
+                  t.setTextColor(fg);
+                  t.setGravity(android.view.Gravity.CENTER);
+                  t.setSingleLine(true);
+                  t.setIncludeFontPadding(false);
+                  int n = label.codePointCount(0, label.length());
+                  boolean emoji = n >= 1 && !Character.isLetterOrDigit(label.codePointAt(0));
+                  float f = emoji ? sizeDp * 0.48f : n <= 1 ? sizeDp * 0.42f : n == 2 ? sizeDp * 0.34f : n == 3 ? sizeDp * 0.28f : sizeDp * 0.23f;
+                  t.setTextSize(f);
+                  if (!emoji) t.setTypeface(null, android.graphics.Typeface.BOLD);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setShape(GradientDrawable.OVAL);
+                  g.setColor(bg);
+                  t.setBackground(g);
+                  int px = dp(c, sizeDp);
+                  t.setLayoutParams(new LinearLayout.LayoutParams(px, px));
+                  return t;
+              }
+
               public static View line(Context c) {
                   View v = new View(c);
                   v.setBackgroundColor(LINE);
@@ -2346,30 +2443,72 @@ jobs:
                       h.addView(amountCol(exp, Ui.RED));
                       card.addView(h);
                       card.addView(Ui.line(this));
-                      for (Db.Tx t : day) card.addView(txRow(t, hm));
+                      for (int k = 0; k < day.size(); k++) {
+                          if (k > 0) card.addView(inset());
+                          card.addView(txRow(day.get(k), hm));
+                      }
                   }
               }
 
               private View txRow(Db.Tx t, SimpleDateFormat hm) {
                   LinearLayout r = new LinearLayout(this);
                   r.setGravity(Gravity.CENTER_VERTICAL);
-                  r.setPadding(dp(14), dp(10), dp(14), dp(10));
-                  String c = t.type == 2 ? "⇄ โอน" : t.type == 3 ? "ปรับยอด"
-                      : !t.category.isEmpty() ? t.category : (t.needAi || t.needCat ? "🤖 รอ AI" : "-");
-                  r.addView(Ui.one(text(13, Ui.GRAY, c)), new LinearLayout.LayoutParams(dp(92), WRAP));
+                  r.setPadding(dp(14), dp(11), dp(14), dp(11));
+
+                  boolean pending = t.category.isEmpty() && (t.needAi || t.needCat);
+                  TextView icon = t.type == 2 ? Ui.circle(this, "⇄", Color.rgb(236, 239, 241), Ui.GRAY, 40)
+                      : t.type == 3 ? Ui.circle(this, "⚖️", Color.rgb(236, 239, 241), Ui.GRAY, 40)
+                      : pending ? Ui.circle(this, "🤖", Color.rgb(255, 248, 225), Ui.GRAY, 40)
+                      : Ui.catBadge(this, t.category, 40);
+                  r.addView(icon);
+
                   LinearLayout mid = new LinearLayout(this);
                   mid.setOrientation(LinearLayout.VERTICAL);
-                  mid.addView(Ui.one(text(15, Ui.DARK, t.type == 2 ? t.account + " → " + t.toAccount : t.note.isEmpty() ? c : t.note)));
+                  mid.setPadding(dp(12), 0, dp(8), 0);
+                  String catName = t.type == 2 ? "โอนเงิน" : t.type == 3 ? "ปรับยอด"
+                      : !t.category.isEmpty() ? Ui.catLabel(t.category) : pending ? "รอ AI จัดหมวด" : "ไม่มีหมวด";
+                  String title = t.type == 2 ? t.account + "  →  " + t.toAccount : t.note.isEmpty() ? catName : t.note;
+                  TextView tt = Ui.one(text(15, Ui.DARK, title));
+                  tt.setTypeface(null, Typeface.BOLD);
+                  mid.addView(tt);
+
+                  LinearLayout subRow = new LinearLayout(this);
+                  subRow.setGravity(Gravity.CENTER_VERTICAL);
+                  subRow.setPadding(0, dp(4), 0, 0);
+                  if (t.type != 2 && !t.note.isEmpty()) {
+                      TextView chip = Ui.one(text(11, Ui.GRAY, catName));
+                      chip.setPadding(dp(7), dp(1), dp(7), dp(1));
+                      chip.setBackground(Ui.round(Ui.BG, dp(8), 0, 0));
+                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                      cp.setMargins(0, 0, dp(6), 0);
+                      subRow.addView(chip, cp);
+                  }
+                  subRow.addView(Ui.accountBadge(this, t.account, 16));
                   boolean check = t.amount == 0 || ("slip".equals(t.source) && t.needAi);
-                  mid.addView(Ui.one(text(12, Ui.GRAY, (t.type == 2 ? "ไม่นับในรายรับ/รายจ่าย" : t.account) + "   " + hm.format(new Date(t.ts))
-                      + (t.photo.isEmpty() ? "" : "   📷") + (check ? "   ⚠️ตรวจยอด" : ""))));
+                  TextView info = Ui.one(text(12, Ui.GRAY, " " + (t.type == 2 ? "ไม่นับรายรับ/รายจ่าย" : t.account)
+                      + " · " + hm.format(new Date(t.ts)) + (t.photo.isEmpty() ? "" : "  📷") + (check ? "  ⚠️ตรวจยอด" : "")));
+                  subRow.addView(info, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  mid.addView(subRow);
                   r.addView(mid, new LinearLayout.LayoutParams(0, WRAP, 1f));
-                  TextView a = text(15, t.type == 1 ? Ui.BLUE : t.type == 0 ? Ui.RED : Ui.GRAY, Util.money(t.amount));
-                  a.setPadding(dp(8), 0, 0, 0);
+
+                  String sign = t.type == 0 ? "-" : t.type == 1 ? "+" : t.type == 3 && t.amount > 0 ? "+" : "";
+                  TextView a = text(15, t.type == 1 ? Ui.BLUE : t.type == 0 ? Ui.RED : Ui.GRAY,
+                      sign + Util.money(t.type == 3 ? Math.abs(t.amount) : t.amount));
+                  a.setTypeface(null, Typeface.BOLD);
                   r.addView(a);
                   final long id = t.id;
                   r.setOnClickListener(v -> openEdit(id, 0));
                   return r;
+              }
+
+              /** thin divider indented past the icon */
+              private View inset() {
+                  View v = new View(this);
+                  v.setBackgroundColor(Ui.LINE);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, 1);
+                  lp.setMargins(dp(66), 0, 0, 0);
+                  v.setLayoutParams(lp);
+                  return v;
               }
 
               private void renderCalendar(List<Db.Tx> list) {
@@ -2568,8 +2707,11 @@ jobs:
                   for (Map.Entry<String, Double> e : bal.entrySet()) {
                       LinearLayout r = new LinearLayout(this);
                       r.setGravity(Gravity.CENTER_VERTICAL);
-                      r.setPadding(dp(16), dp(14), dp(16), dp(14));
-                      r.addView(Ui.one(text(15, Ui.DARK, e.getKey())), new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      r.setPadding(dp(16), dp(12), dp(16), dp(12));
+                      r.addView(Ui.accountBadge(this, e.getKey(), 36));
+                      TextView an0 = Ui.one(text(15, Ui.DARK, e.getKey()));
+                      an0.setPadding(dp(12), 0, dp(8), 0);
+                      r.addView(an0, new LinearLayout.LayoutParams(0, WRAP, 1f));
                       r.addView(text(15, e.getValue() >= 0 ? Ui.BLUE : Ui.RED, Util.money(e.getValue())));
                       final String an = e.getKey();
                       final double cur = e.getValue();
@@ -2631,9 +2773,14 @@ jobs:
                   back.setPadding(0, dp(4), 0, dp(8));
                   back.setOnClickListener(v -> { accView = null; render(); });
                   head.addView(back);
+                  LinearLayout nmRow = new LinearLayout(this);
+                  nmRow.setGravity(Gravity.CENTER_VERTICAL);
+                  nmRow.addView(Ui.accountBadge(this, acc, 44));
                   TextView nm = text(20, Ui.DARK, acc);
                   nm.setTypeface(null, Typeface.BOLD);
-                  head.addView(nm);
+                  nm.setPadding(dp(12), 0, 0, 0);
+                  nmRow.addView(nm);
+                  head.addView(nmRow);
                   head.addView(text(14, bal >= 0 ? Ui.BLUE : Ui.RED, "ยอดคงเหลือ " + Util.money(bal) + " บาท"));
                   LinearLayout bb = new LinearLayout(this);
                   Button adj = btn("ปรับยอด", v -> adjustBalance(acc, bal));
