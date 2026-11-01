@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.11 icons + nicer list)
+name: Build AutoBook APK (v3.12 keep MM photos)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 18
-                  versionName = "3.11"
+                  versionCode = 19
+                  versionName = "3.12"
               }
               signingConfigs {
                   create("fixed") {
@@ -1407,10 +1407,57 @@ jobs:
                   }
                   try {
                       d.insertOrThrow(table, null, v);
+                      if ("INOUTCOME".equals(table)) relinkPhotos(v);
                   } catch (Exception e) {
                       throw new RuntimeException("เขียน " + table + " ไม่ได้: " + e.getMessage() + "\nคอลัมน์: " + v.keySet()
                           + "\nโครงตาราง: " + schema(table));
                   }
+              }
+
+              // ---------- keep photos attached in Money Manager ----------
+              /** key "type|date|amount" -> uids of old transactions that had photos */
+              private final Map<String, List<String>> photoTx = new HashMap<>();
+              private int photosRelinked = 0, photosTotal = 0;
+
+              private static String photoKey(Object type, Object date, Object money) {
+                  try {
+                      long t = Math.round(Double.parseDouble(s(type)));
+                      long z = Math.round(Double.parseDouble(s(date)));
+                      long m = Math.round(Math.abs(Double.parseDouble(s(money))) * 100);
+                      return t + "|" + z + "|" + m;
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              /** remember which transactions have photos, before the old rows are deleted */
+              private void collectPhotos() {
+                  try (Cursor k = d.rawQuery("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'PHOTO'", null)) {
+                      if (!k.moveToFirst()) return;
+                  }
+                  try (Cursor c = d.rawQuery("SELECT DISTINCT p.txUid, i.DO_TYPE, i.ZDATE, i.ZMONEY FROM PHOTO p "
+                          + "JOIN INOUTCOME i ON i.uid = p.txUid WHERE IFNULL(p.IS_DEL, 0) = 0", null)) {
+                      while (c.moveToNext()) {
+                          String key = photoKey(c.getString(1), c.getString(2), c.getString(3));
+                          if (key == null) continue;
+                          List<String> l = photoTx.get(key);
+                          if (l == null) { l = new java.util.ArrayList<>(); photoTx.put(key, l); }
+                          l.add(c.getString(0));
+                          photosTotal++;
+                      }
+                  }
+              }
+
+              /** a new row with the same type + date + amount takes over the old row's photos */
+              private void relinkPhotos(ContentValues v) {
+                  if (photoTx.isEmpty()) return;
+                  String key = photoKey(v.get("DO_TYPE"), v.get("ZDATE"), v.get("ZMONEY"));
+                  List<String> l = key == null ? null : photoTx.get(key);
+                  if (l == null || l.isEmpty()) return;
+                  String old = l.remove(0);
+                  if (l.isEmpty()) photoTx.remove(key);
+                  d.execSQL("UPDATE PHOTO SET txUid = ? WHERE txUid = ?", new Object[] { v.getAsString("uid"), old });
+                  photosRelinked++;
               }
 
               private String schema(String table) {
@@ -1533,6 +1580,7 @@ jobs:
                       int n = 0;
                       d.beginTransaction();
                       try {
+                          collectPhotos();
                           d.delete("INOUTCOME", null, null);
                           for (Db.Tx t : all) {
                               if (t.amount == 0) continue;
@@ -1581,7 +1629,9 @@ jobs:
                       } finally {
                           d.endTransaction();
                       }
-                      return "ส่งออก " + n + " รายการ";
+                      String ph = photosTotal == 0 ? "" : "\nรูปใน Money Manager: ผูกกลับ " + photosRelinked + "/" + photosTotal + " รายการ"
+                          + (photosRelinked < photosTotal ? " (ที่เหลือไม่พบรายการวันเวลา+ยอดเดียวกัน)" : "");
+                      return "ส่งออก " + n + " รายการ" + ph;
                   } finally {
                       d.close();
                   }
