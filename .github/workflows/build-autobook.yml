@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.12 keep MM photos)
+name: Build AutoBook APK (v3.13 check slip text)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 19
-                  versionName = "3.12"
+                  versionCode = 20
+                  versionName = "3.13"
               }
               signingConfigs {
                   create("fixed") {
@@ -930,6 +930,58 @@ jobs:
                   }
               }
 
+              // ---------- is this image really a payment slip? ----------
+              // (the clock in the status bar is on every screenshot, so time alone does not count)
+              private static final Pattern DATE = Pattern.compile(
+                  "(?<![0-9])(25[5-7][0-9]|20[2-3][0-9])(?![0-9])"
+                  + "|(?<![0-9])[0-3]?[0-9][/.-][01]?[0-9][/.-]([0-9]{2}|[0-9]{4})(?![0-9])"
+                  + "|(?i)\\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s*[0-9]{2,4}"
+                  + "|(ม\\.ค|ก\\.พ|มี\\.ค|เม\\.ย|พ\\.ค|มิ\\.ย|ก\\.ค|ส\\.ค|ก\\.ย|ต\\.ค|พ\\.ย|ธ\\.ค)");
+              private static final Pattern REF = Pattern.compile("[0-9]{10,}");
+              private static final Pattern MASK = Pattern.compile("[xX*•]{2,}[\\s-]?[0-9]{3,4}(?![0-9])");
+              private static final Pattern FEE = Pattern.compile("(?<![0-9.,])0\\.00(?![0-9])");
+              private static final String[] WORDS = {
+                  "successful", "success", "ref no", "ref.", "reference", "transaction id", "transaction no", "fee",
+                  "biller", "bill payment", "e-slip", "slip",
+                  "สำเร็จ", "เลขที่รายการ", "รหัสอ้างอิง", "ค่าธรรมเนียม", "จำนวนเงิน", "ผู้รับ", "ชำระเงิน" };
+
+              /** {amount, date, masked account, reference no., fee 0.00, slip words} */
+              public static boolean[] signals(String s) {
+                  boolean[] b = new boolean[6];
+                  if (s == null) return b;
+                  b[0] = pick(s) != null;
+                  b[1] = DATE.matcher(s).find();
+                  b[2] = MASK.matcher(s).find();
+                  b[3] = REF.matcher(s).find();
+                  b[4] = FEE.matcher(s).find();
+                  String l = s.toLowerCase(java.util.Locale.ROOT);
+                  for (String w : WORDS) if (l.contains(w)) { b[5] = true; break; }
+                  return b;
+              }
+
+              /** needs an amount + at least 3 of the other 5 signs */
+              public static boolean looksLikeSlip(String s) {
+                  boolean[] b = signals(s);
+                  if (!b[0]) return false;
+                  int n = 0;
+                  for (int i = 1; i < b.length; i++) if (b[i]) n++;
+                  return n >= 3;
+              }
+
+              /** short text for the debug log */
+              public static String explain(String s) {
+                  if (s == null) return "อ่านข้อความในรูปไม่ได้";
+                  boolean[] b = signals(s);
+                  String[] names = { "ยอดเงิน", "วันที่", "เลขบัญชี", "เลขอ้างอิง", "ค่าธรรมเนียม 0.00", "คำในสลิป" };
+                  StringBuilder sb = new StringBuilder();
+                  int n = 0;
+                  for (int i = 0; i < b.length; i++) {
+                      sb.append(names[i]).append(b[i] ? "✓ " : "✗ ");
+                      if (i > 0 && b[i]) n++;
+                  }
+                  return sb.append("(").append(n).append("/5 ต้องมียอดเงิน+3)").toString();
+              }
+
               static String pick(String s) {
                   Matcher m = MONEY.matcher(s);
                   double best = 0;
@@ -1171,6 +1223,14 @@ jobs:
 
                   // hidden notification waiting for amount -> attach slip and read amount from it
                   String ocr = Slip.readText(this, Photos.file(this, name));
+                  boolean slipOk = Slip.looksLikeSlip(ocr);
+                  Util.debug(this, "ตรวจสลิป " + (slipOk ? "✅" : "❌") + " " + Slip.explain(ocr));
+                  if (!slipOk) {
+                      // balance page / other screenshot from the bank app -> do not save anything
+                      Photos.delete(this, name);
+                      Util.debug(this, "IMG ข้าม - ข้อความในรูปไม่เหมือนสลิป");
+                      return;
+                  }
                   String a = ocr == null ? null : Slip.pick(ocr);
                   String acc = Util.byDigits(this, ocr);
                   if (acc != null) Util.debug(this, "สลิปจากบัญชี " + acc);
