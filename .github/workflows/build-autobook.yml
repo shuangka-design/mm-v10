@@ -1,4 +1,4 @@
-name: Build AutoBook APK (v3.13 check slip text)
+name: Build AutoBook APK (v3.14 fix missed notifications)
 
 on:
   push:
@@ -69,8 +69,8 @@ jobs:
                   applicationId = "com.example.autobook"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 20
-                  versionName = "3.13"
+                  versionCode = 21
+                  versionName = "3.14"
               }
               signingConfigs {
                   create("fixed") {
@@ -312,10 +312,13 @@ jobs:
                       new String[] { bank, account, String.valueOf(amount), String.valueOf(since) }, null).isEmpty();
               }
 
-              /** other side of a transfer: opposite direction, same amount, another bank, recent */
-              public Tx pair(int type, double amount, long since, String notBank) {
-                  List<Tx> l = query("type=? AND source IN ('noti','slip') AND bank<>'' AND bank<>? AND ABS(amount-?)<0.005 AND ts>?",
-                      new String[] { String.valueOf(type), notBank, String.valueOf(amount), String.valueOf(since) }, "ts DESC");
+              /** other side of a transfer: opposite direction, same amount, recent,
+               *  from another bank OR the same bank but another of my accounts (BBL AAT <-> BK692) */
+              public Tx pair(int type, double amount, long since, String bank, String myAccount) {
+                  String me = myAccount == null ? "" : myAccount;
+                  List<Tx> l = query("type=? AND source IN ('noti','slip') AND bank<>'' AND ABS(amount-?)<0.005 AND ts>?"
+                      + " AND (bank<>? OR (?<>'' AND account<>?))",
+                      new String[] { String.valueOf(type), String.valueOf(amount), String.valueOf(since), bank, me, me }, "ts DESC");
                   return l.isEmpty() ? null : l.get(0);
               }
 
@@ -619,7 +622,7 @@ jobs:
                   String old = p(c).getString("debug", "");
                   String[] lines = (old.isEmpty() ? entry : entry + "\n" + old).split("\n");
                   StringBuilder sb = new StringBuilder();
-                  for (int i = 0; i < lines.length && i < 25; i++) {
+                  for (int i = 0; i < lines.length && i < 80; i++) {
                       if (i > 0) sb.append("\n");
                       sb.append(lines[i]);
                   }
@@ -732,6 +735,16 @@ jobs:
               }
 
               public static boolean isBank(String pkg) { return BANKS.containsKey(pkg); }
+
+              private static final String[] BANKISH = { "bank", "ktb", "krungthai", "paotang", "bbl", "bualuang",
+                  "krungsri", "gsb", "mymo", "truemoney", "scb", "kasikorn", "kplus", "ttb", "uob", "promptpay" };
+
+              /** a bank-like app we do not read yet -> only for the debug log */
+              public static boolean looksLikeBank(String pkg) {
+                  String l = pkg.toLowerCase(Locale.ROOT);
+                  for (String w : BANKISH) if (l.contains(w)) return true;
+                  return false;
+              }
 
               public static String bankFromPath(String path) {
                   String l = path.toLowerCase(Locale.ROOT);
@@ -1041,16 +1054,23 @@ jobs:
           package com.example.autobook;
 
           import android.app.Notification;
+          import android.content.ComponentName;
           import android.content.ContentUris;
+          import android.content.SharedPreferences;
           import android.database.ContentObserver;
           import android.database.Cursor;
           import android.net.Uri;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.Parcelable;
           import android.provider.MediaStore;
           import android.service.notification.NotificationListenerService;
           import android.service.notification.StatusBarNotification;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
 
@@ -1067,7 +1087,15 @@ jobs:
               }
 
               @Override
-              public void onListenerDisconnected() { stopImageWatch(); }
+              public void onListenerDisconnected() {
+                  stopImageWatch();
+                  Util.debug(this, "SYSTEM: ⚠️ บริการหลุด กำลังขอเชื่อมต่อใหม่");
+                  try {
+                      requestRebind(new ComponentName(this, BankNotificationService.class));
+                  } catch (Exception e) {
+                      Util.debug(this, "SYSTEM: ขอเชื่อมต่อใหม่ไม่ได้ " + e.getMessage());
+                  }
+              }
 
               @Override
               public void onDestroy() {
@@ -1075,40 +1103,108 @@ jobs:
                   super.onDestroy();
               }
 
+              private final Map<String, Long> unknownLogged = new HashMap<>();
+              private static final Object SEEN_LOCK = new Object();
+
               @Override
               public void onNotificationPosted(StatusBarNotification sbn) {
                   if (sbn == null) return;
                   String pkg = sbn.getPackageName();
-                  if (pkg == null || pkg.equals(getPackageName()) || !BankParser.isBank(pkg)) return;
+                  if (pkg == null || pkg.equals(getPackageName())) return;
+                  if (!BankParser.isBank(pkg)) {
+                      if (BankParser.looksLikeBank(pkg)) {
+                          Long last = unknownLogged.get(pkg);
+                          long now = System.currentTimeMillis();
+                          if (last == null || now - last > 6L * 3600000L) {
+                              unknownLogged.put(pkg, now);
+                              Util.debug(this, "- แอปนี้ยังไม่รองรับ | " + pkg);
+                          }
+                      }
+                      return;
+                  }
                   Notification n = sbn.getNotification();
+                  if (n == null) return;
                   if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) return;
                   Bundle ex = n.extras;
                   if (ex == null) return;
                   CharSequence t = ex.getCharSequence(Notification.EXTRA_TITLE);
                   CharSequence b = ex.getCharSequence(Notification.EXTRA_BIG_TEXT);
-                  if (b == null) b = ex.getCharSequence(Notification.EXTRA_TEXT);
+                  if (b == null || b.toString().trim().isEmpty()) b = ex.getCharSequence(Notification.EXTRA_TEXT);
+                  if ((b == null || b.toString().trim().isEmpty()) && n.tickerText != null) b = n.tickerText;
                   final String title = t == null ? "" : t.toString();
                   final String text = b == null ? "" : b.toString();
+
+                  // grouped notifications (InboxStyle / MessagingStyle) keep each payment on its own line
+                  final List<String> lines = new ArrayList<>();
+                  try {
+                      CharSequence[] tl = ex.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
+                      if (tl != null) for (CharSequence l : tl) if (l != null && l.toString().trim().length() > 0) lines.add(l.toString());
+                      Parcelable[] ms = ex.getParcelableArray(Notification.EXTRA_MESSAGES);
+                      if (ms != null) for (Parcelable p : ms) {
+                          if (p instanceof Bundle) {
+                              CharSequence m = ((Bundle) p).getCharSequence("text");
+                              if (m != null && m.toString().trim().length() > 0) lines.add(m.toString());
+                          }
+                      }
+                  } catch (Exception ignored) { }
                   final long when = sbn.getPostTime();
-                  bg.execute(() -> handleNotification(pkg, title, text, when));
+                  bg.execute(() -> handleAll(pkg, title, text, lines, when));
               }
 
-              private void handleNotification(String pkg, String title, String text, long when) {
+              private void handleAll(String pkg, String title, String text, List<String> lines, long when) {
                   if (hidden(text) || hidden(title)) {
                       handleHidden(pkg, when);
                       return;
                   }
+                  if (lines.isEmpty() || BankParser.parse(pkg, title, text) != null) {
+                      handleNotification(pkg, title, text, when, 120000L);
+                      return;
+                  }
+                  Util.debug(this, "แจ้งเตือนแบบรวม " + lines.size() + " บรรทัด | " + pkg + " | " + title);
+                  // a line may repeat a payment we saved earlier today -> remember lines for 24 h
+                  for (String l : lines) handleNotification(pkg, title, l, when, 24L * 3600000L);
+              }
+
+              /** true if exactly this notification text was handled within the window (bank apps re-post the same one) */
+              private boolean seen(String key, long when, long window) {
+                  synchronized (SEEN_LOCK) {
+                      SharedPreferences sp = getSharedPreferences("autobook_seen", MODE_PRIVATE);
+                      String h = Integer.toHexString(key.hashCode()) + "_" + key.length();
+                      long now = System.currentTimeMillis();
+                      StringBuilder keep = new StringBuilder();
+                      boolean dup = false;
+                      int count = 0;
+                      for (String line : sp.getString("seen", "").split("\n")) {
+                          int tab = line.indexOf('\t');
+                          if (tab < 0) continue;
+                          long ts;
+                          try { ts = Long.parseLong(line.substring(0, tab)); } catch (Exception e) { continue; }
+                          if (now - ts > 24L * 3600000L || count >= 400) continue;
+                          if (line.substring(tab + 1).equals(h) && Math.abs(when - ts) < window) dup = true;
+                          keep.append(line).append('\n');
+                          count++;
+                      }
+                      if (!dup) keep.insert(0, when + "\t" + h + "\n");
+                      sp.edit().putString("seen", keep.toString()).apply();
+                      return dup;
+                  }
+              }
+
+              private void handleNotification(String pkg, String title, String text, long when, long dupWindow) {
                   BankParser.Result r = BankParser.parse(pkg, title, text);
                   Util.debug(this, (r != null ? "OK " + r.amount : "X อ่านยอดไม่ได้") + " | " + pkg + " | " + title + " | " + text);
                   if (r == null) return;
+                  if (seen(pkg + "|" + title + "|" + text, when, dupWindow)) {
+                      Util.debug(this, "- ข้าม: แจ้งเตือนซ้ำ ข้อความเดิม " + Util.money(r.amount));
+                      return;
+                  }
                   Db db = Db.get(this);
-                  if (db.duplicate(r.bank, Util.account(this, r.bank), r.amount, when - 120000L)) return;
+                  String mine = Util.byDigits(this, title + " " + text);
 
                   // money left one of my accounts and arrived in another -> one transfer
-                  Db.Tx p = db.pair(1 - r.type, r.amount, when - 600000L, r.bank);
+                  Db.Tx p = db.pair(1 - r.type, r.amount, when - 600000L, r.bank, mine);
                   if (p != null) {
-                      String me = Util.byDigits(this, title + " " + text);
-                      if (me == null) me = Util.account(this, r.bank);
+                      String me = mine != null ? mine : Util.account(this, r.bank);
                       db.addAccount(me);
                       String from = r.type == 0 ? me : p.account;
                       String to = r.type == 0 ? p.account : me;
@@ -2334,6 +2430,11 @@ jobs:
               @Override
               protected void onResume() {
                   super.onResume();
+                  if (listenerEnabled()) {
+                      // MagicOS sometimes kills the listener in the background -> reconnect whenever the app opens
+                      try { NotificationListenerService.requestRebind(new ComponentName(this, BankNotificationService.class)); }
+                      catch (Exception ignored) { }
+                  }
                   render();
                   bg.execute(() -> {
                       aiStatus = Ai.status();
